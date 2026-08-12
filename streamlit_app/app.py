@@ -12,12 +12,18 @@ BASE_MODEL = st.secrets.get("BASE_MODEL", "lambdalabs/sd-pokemon-diffusers")
 CONTROLNET = "lllyasviel/control_v11p_sd15_softedge"
 SIZE = 512  # SD1.5 네이티브 해상도
 
+# "monster"는 절대 넣지 말 것. 학습 데이터(pokemon-blip-captions)는 BLIP 자동 캡션이라
+# 무서운 포켓몬들이 "a monster"/"a demon"으로 캡션됐다. 그래서 이 단어 하나로 악타입
+# 클러스터가 소환되고, "cute"를 붙여도 못 이긴다(실측 확인). 귀여움은 형용사가 아니라
+# 명사 선택의 문제 — round/chubby/mascot 계열 어휘로 부를 것.
 PROMPT = (
-    "a cute original monster creature, chibi, big expressive eyes, "
-    "vibrant colors, simple clean background, character art"
+    "a cute round creature, big sparkling eyes, smiling face, "
+    "chubby simple body, bright cheerful colors, mascot character"
 )
-# "human/person" 억제 = 윤곽은 ControlNet이 주고 내용물은 몬스터로 채우게 만드는 핵심
+# 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
 NEG_PROMPT = (
+    "monster, demon, scary, evil, fangs, sharp teeth, claws, bat wings, "
+    "dark, muscular, horror, "
     "human, person, realistic face, photograph, text, watermark, "
     "blurry, deformed, extra limbs, ugly"
 )
@@ -146,7 +152,7 @@ with st.sidebar:
     st.subheader("생성 설정")
     # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
     control_scale = st.slider(
-        "형태 반영 강도", 0.0, 1.2, 0.6, 0.05,
+        "형태 반영 강도", 0.0, 1.2, 0.5, 0.05,
         help="낮음 = 크리처형(형태 힌트만) · 높음 = 마스코트형(사람 윤곽 뚜렷)",
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
