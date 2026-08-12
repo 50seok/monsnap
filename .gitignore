@@ -4,3 +4,8 @@ __pycache__/
 node_modules/
 dist/
 **/.streamlit/secrets.toml
+
+# 포켓몬 학습 데이터·산출물은 절대 커밋 금지 (PRD §10: 비공개 연습·포트폴리오 증빙까지만)
+dataset/
+lora_out/
+*.safetensors
