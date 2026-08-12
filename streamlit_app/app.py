@@ -98,15 +98,24 @@ def face_box(img: Image.Image) -> tuple[int, int, int, int] | None:
 
 
 def prepare(img: Image.Image, size: int = SIZE) -> tuple[Image.Image, bool]:
-    """EXIF 회전 보정 → 얼굴 크롭 → 정사각 리사이즈. (이미지, 얼굴검출여부) 반환."""
-    img = ImageOps.exif_transpose(img).convert("RGB")  # 휴대폰 사진은 회전정보가 EXIF에 있다
-    box = face_box(img)
-    found = box is not None
-    if box is None:
-        side = min(img.size)  # 폴백: 중앙 정사각 크롭
-        box = ((img.width - side) // 2, (img.height - side) // 2)
-        box = (box[0], box[1], box[0] + side, box[1] + side)
-    return img.crop(box).resize((size, size), Image.LANCZOS), found
+    """회전 보정 → 얼굴 크롭 → 정사각 리사이즈. (이미지, 얼굴검출여부) 반환.
+
+    EXIF를 먼저 적용하되 그것만 믿지 않는다. 메신저를 거친 사진은 EXIF가 통째로
+    날아가고, 태그가 실제 방향과 어긋난 사진도 흔하다. 그래서 얼굴을 못 찾으면
+    90도씩 돌려가며 재시도한다 — 얼굴이 잡히는 방향이 곧 올바른 방향이다.
+    실패한 검출 1회는 640px 축소본 기준 수 ms라 비용은 무시할 수준.
+    """
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    for angle in (0, 270, 90, 180):  # 0 = EXIF가 맞은 경우(대부분 여기서 끝)
+        candidate = img if angle == 0 else img.rotate(angle, expand=True)
+        box = face_box(candidate)
+        if box is not None:
+            return candidate.crop(box).resize((size, size), Image.LANCZOS), True
+
+    side = min(img.size)  # 폴백: 중앙 정사각 크롭
+    left, top = (img.width - side) // 2, (img.height - side) // 2
+    return img.crop((left, top, left + side, top + side)).resize((size, size), Image.LANCZOS), False
 
 
 def to_png(img: Image.Image) -> bytes:
