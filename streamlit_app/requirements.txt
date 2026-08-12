@@ -11,3 +11,4 @@ accelerate
 safetensors
 peft
 controlnet_aux
+rembg

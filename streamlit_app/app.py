@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 # 로컬 생성 스택: SD1.5 파생 모델 + ControlNet lineart(형태·특징 유지)
 # ponytail: 베이스 모델은 secrets로 교체 가능 — LoRA 자체 학습 후 여기만 바꾸면 됨
@@ -67,6 +67,30 @@ def edge_detector():
     from controlnet_aux import LineartDetector
 
     return LineartDetector.from_pretrained("lllyasviel/Annotators")
+
+
+@st.cache_resource(show_spinner=False)
+def bg_remover():
+    from rembg import new_session
+
+    return new_session("u2net")
+
+
+def mask_background(photo: Image.Image, edge: Image.Image) -> Image.Image:
+    """인물 영역 밖의 선을 지운다.
+
+    얼굴 크롭을 1.8배로 넉넉히 잡다 보니(헤어 보존 목적) 선반·포스터·의자 같은
+    배경 모서리가 같이 딸려와 ControlNet에 '특징'으로 들어갔다. 타원 마스크로도
+    모서리는 지워지지만 타원 안쪽 배경이 남아서, 인물 분리(u2net)를 쓴다.
+    헤어 라인을 정확히 보존하면서 배경만 없애는 게 핵심.
+    """
+    from rembg import remove
+
+    alpha = remove(photo, session=bg_remover()).getchannel("A")
+    alpha = alpha.filter(ImageFilter.GaussianBlur(4))  # 경계 계단 방지
+    masked = Image.new("RGB", edge.size, "black")
+    masked.paste(edge, (0, 0), alpha.resize(edge.size))
+    return masked
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -136,7 +160,7 @@ def to_png(img: Image.Image) -> bytes:
 def generate(photo_bytes: bytes, control_scale: float, steps: int):
     """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부) 반환."""
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
-    control = edge_detector()(photo)
+    control = mask_background(photo, edge_detector()(photo))
     result = pipeline()(
         prompt=PROMPT,
         negative_prompt=NEG_PROMPT,
