@@ -161,7 +161,63 @@
 | 7 | Phase 3 브랜딩(오리지널 몬스터 세계관) | Phase 2 완료 후 |
 | 8 | **시드 정책** — 유력안 = **계층 시드**: 얼굴 임베딩(주 키)이 종족·실루엣 결정, 이름 해시(보조)는 색·장식만 결정 + 속성 선택(불/물/풀) 옵션. Phase 1은 이름 제약 없음(이름 바꿔 다중 생성 = 놀이로 수용, 비용은 횟수 제한으로 방어), 계층 시드는 Phase 2~실서비스에서 적용 | Phase 1 샘플 생성 후 |
 
-## 13. 구현 상태 (2026-08-12) — 로컬 생성으로 전환
+## 13. 구현 상태 (2026-08-13) — 중단 시점 인계
+
+### 다음 세션 재개 키워드
+`모듈형 전환` `표준 SD1.5` `스타일 LoRA` `가중치 균형` `계층 시드`
+
+### 직전 검증 결과 (가장 중요)
+**표준 SD1.5 + lineart ControlNet + IP-Adapter FaceID** (스타일 LoRA 없이) 실측:
+- ✅ **FaceID가 표준 베이스에서 강력히 작동.** 원본 인물과 명확히 닮은 얼굴, 안경까지 정확 반영.
+  기존 `sd-pokemon-diffusers` 베이스에서 효과가 미미했던 원인이 "풀 파인튜닝된 베이스가
+  어댑터를 막는다"였음이 확인됨.
+- ❌ 결과가 **"카툰화된 사람"** — 크리처가 아님. 네거티브 `human, person`이 FaceID에 압도됨.
+- → **닮음은 해결 가능. 남은 과제는 스타일로 사람→크리처 방향으로 밀어내기.**
+
+### 다음 작업 (순서대로)
+1. **스타일 LoRA 확보** — 자체 학습(`dataset/cute` 200장 준비 완료) 또는 공개 LoRA로 선검증
+   - 자체 학습이 PRD §2 차별점("직접 학습 증빙")의 핵심이므로 최종적으로는 자체 학습 필요
+   - `runwayml/stable-diffusion-v1-5`는 HF에서 삭제됨 → `stable-diffusion-v1-5/stable-diffusion-v1-5` 사용
+2. **가중치 균형 탐색** — LoRA weight 0.6~0.8 × FaceID scale 0.3~0.6
+   - FaceID가 세면 사람이 되고, 약하면 안 닮음. 이 축이 최종 품질을 결정함
+3. **시드 결정론** (§12-8 계층 시드) — 현재 같은 사람도 매번 다른 몬스터가 나옴.
+   얼굴 임베딩 → 해시 → 시드로 "같은 사람 = 같은 몬스터" 확보. insightface 설치 완료돼 코드 10줄
+4. **A/B 비교** — 기존 pokemon-diffusers 경로 vs 새 모듈형 경로. `BASE_MODEL`이 secrets로
+   교체 가능하므로 롤백 가능
+
+### 완료된 것 (커밋 순)
+- `8a013db` git init, Gemini 버전 보존. `.gitignore` 실키 노출 버그 수정(`**/` 누락)
+- `bea7f77` 로컬 파이프라인 전환 (API 결제 벽 회피, 생성 5초/장)
+- `2faa8cb` 얼굴 검출(YuNet) + EXIF 회전 보정 — 배경이 특징으로 섞이던 문제
+- `bd82f94` EXIF 없는 사진 대비 90도 회전 재시도
+- `781a69f` 프롬프트에서 `monster` 제거 — 악타입 소환의 원인 (BLIP 캡션 편향)
+- `8ef4ad7` 큐레이션 도구 (PokéAPI 1025장 → CLIP 점수 → 상위 200장)
+- `d114c08` ControlNet softedge → lineart, 기본 강도 0.65
+- `e9ce0e9` 배경 제거 (rembg u2net)
+- `6914c9d` 턱 아래 컷 — 수건/옷 질감 제거
+
+### 현재 스택
+| 역할 | 모델 |
+|---|---|
+| 생성 베이스 | `lambdalabs/sd-pokemon-diffusers` (교체 예정) |
+| 형태 제어 | `lllyasviel/control_v11p_sd15_lineart` @ 0.65 |
+| 윤곽선 | `lllyasviel/Annotators` LineartDetector |
+| 얼굴 검출 | YuNet `models/yunet.onnx` |
+| 배경 제거 | rembg `u2net` + 턱 아래 컷(0.80) |
+| 미사용(설치됨) | `h94/IP-Adapter-FaceID`, insightface `buffalo_l`, CLIP |
+
+### 미해결 이슈
+- **정체성 일관성 없음** — 같은 사람도 시드에 따라 전혀 다른 몬스터 (→ 작업 3번)
+- **귀여움 부족** — 베이스 모델이 2022년 SD1.4 파인튜닝이라 한계 (→ 작업 1번)
+- **Streamlit Cloud 배포 불가** — 무료 티어에 GPU 없음. §8 Phase 1 산출물 수정 필요
+
+### 실행 방법
+```
+cd C:\Mark42\monsnap\streamlit_app
+.venv\Scripts\python -m streamlit run app.py
+```
+
+### 이전 상태 (2026-08-12) — 로컬 생성으로 전환
 
 **결정: 상용 API 포기, 로컬 GPU 생성으로 Phase 1 진행.** 근거:
 - Gemini 이미지 모델은 무료 티어가 **구조적으로 0**(신형 `gemini-3.1-flash-image`까지 전부 `limit: 0`, 2026-08-12 실측). 모델 교체로 우회 불가.
