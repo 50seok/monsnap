@@ -84,10 +84,23 @@ def mask_background(photo: Image.Image, edge: Image.Image) -> Image.Image:
     모서리는 지워지지만 타원 안쪽 배경이 남아서, 인물 분리(u2net)를 쓴다.
     헤어 라인을 정확히 보존하면서 배경만 없애는 게 핵심.
     """
+    import numpy as np
     from rembg import remove
 
     alpha = remove(photo, session=bg_remover()).getchannel("A")
     alpha = alpha.filter(ImageFilter.GaussianBlur(4))  # 경계 계단 방지
+
+    # rembg는 '인물 전경'을 남기므로 목에 두른 수건·옷이 그대로 통과한다. 천 질감은
+    # 잔선을 대량 만들어 ControlNet에 가짜 구조로 들어간다. 크롭이 얼굴 1.8배 정사각이라
+    # 턱은 대략 높이의 0.78 지점 — 그 아래를 페이드아웃시켜 목/어깨/옷을 버린다.
+    arr = np.array(alpha, dtype=np.float32)
+    height = arr.shape[0]
+    cut, fade = int(height * 0.80), max(1, int(height * 0.10))
+    ramp = np.ones(height, dtype=np.float32)
+    ramp[cut : cut + fade] = np.linspace(1.0, 0.0, min(fade, height - cut))
+    ramp[cut + fade :] = 0.0
+    alpha = Image.fromarray((arr * ramp[:, None]).astype(np.uint8))
+
     masked = Image.new("RGB", edge.size, "black")
     masked.paste(edge, (0, 0), alpha.resize(edge.size))
     return masked
