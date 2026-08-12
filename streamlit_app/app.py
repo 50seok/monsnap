@@ -6,10 +6,13 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageOps
 
-# 로컬 생성 스택: SD1.5 파생 모델 + ControlNet softedge(형태 유지)
+# 로컬 생성 스택: SD1.5 파생 모델 + ControlNet lineart(형태·특징 유지)
 # ponytail: 베이스 모델은 secrets로 교체 가능 — LoRA 자체 학습 후 여기만 바꾸면 됨
 BASE_MODEL = st.secrets.get("BASE_MODEL", "lambdalabs/sd-pokemon-diffusers")
-CONTROLNET = "lllyasviel/control_v11p_sd15_softedge"
+# lineart > softedge (실측). softedge(HED)는 선이 뭉툭해서 눈매·입술·헤어라인이
+# 소실되고 강도를 올리면 뭉개져 붕괴한다. lineart는 쌍꺼풀·코 윤곽까지 선으로 남고
+# 강도를 올려도 붕괴 대신 "사람에 가까워지는" 방향이라 제어 구간이 넓다(0.5~0.8).
+CONTROLNET = "lllyasviel/control_v11p_sd15_lineart"
 SIZE = 512  # SD1.5 네이티브 해상도
 
 # "monster"는 절대 넣지 말 것. 학습 데이터(pokemon-blip-captions)는 BLIP 자동 캡션이라
@@ -61,9 +64,9 @@ def pipeline():
 
 @st.cache_resource(show_spinner=False)
 def edge_detector():
-    from controlnet_aux import HEDdetector
+    from controlnet_aux import LineartDetector
 
-    return HEDdetector.from_pretrained("lllyasviel/Annotators")
+    return LineartDetector.from_pretrained("lllyasviel/Annotators")
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -133,7 +136,7 @@ def to_png(img: Image.Image) -> bytes:
 def generate(photo_bytes: bytes, control_scale: float, steps: int):
     """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부) 반환."""
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
-    control = edge_detector()(photo, scribble=False)
+    control = edge_detector()(photo)
     result = pipeline()(
         prompt=PROMPT,
         negative_prompt=NEG_PROMPT,
@@ -152,8 +155,8 @@ with st.sidebar:
     st.subheader("생성 설정")
     # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
     control_scale = st.slider(
-        "형태 반영 강도", 0.0, 1.2, 0.5, 0.05,
-        help="낮음 = 크리처형(형태 힌트만) · 높음 = 마스코트형(사람 윤곽 뚜렷)",
+        "형태 반영 강도", 0.0, 1.2, 0.65, 0.05,
+        help="0.5=귀엽지만 덜 닮음 · 0.65=권장(균형) · 0.8=닮지만 사람에 가까움",
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
     show_edge = st.checkbox("윤곽선 같이 보기", value=True)
