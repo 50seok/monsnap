@@ -1,9 +1,10 @@
 import io
 import logging
 import time
+from pathlib import Path
 
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 
 # 로컬 생성 스택: SD1.5 파생 모델 + ControlNet softedge(형태 유지)
 # ponytail: 베이스 모델은 secrets로 교체 가능 — LoRA 자체 학습 후 여기만 바꾸면 됨
@@ -59,12 +60,53 @@ def edge_detector():
     return HEDdetector.from_pretrained("lllyasviel/Annotators")
 
 
-def to_square(img: Image.Image, size: int = SIZE) -> Image.Image:
-    """짧은 변 기준 리사이즈 후 중앙 크롭. 인물 사진은 얼굴이 중앙이라 이걸로 충분."""
-    scale = size / min(img.size)
-    img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
-    left, top = (img.width - size) // 2, (img.height - size) // 2
-    return img.crop((left, top, left + size, top + size))
+YUNET = Path(__file__).parent / "models" / "yunet.onnx"
+DETECT_MAX = 640  # 검출은 축소본으로 — 휴대폰 원본(4000px)을 그대로 넣으면 느리고 불안정
+
+
+@st.cache_resource(show_spinner=False)
+def face_detector():
+    """opencv 5의 YuNet. Haar cascade는 opencv 5에서 번들 제외됐고,
+    YuNet이 기울어진 얼굴에도 강해서 촬영 제약을 덜 걸어도 된다."""
+    import cv2
+
+    return cv2.FaceDetectorYN.create(str(YUNET), "", (DETECT_MAX, DETECT_MAX), score_threshold=0.6)
+
+
+def face_box(img: Image.Image) -> tuple[int, int, int, int] | None:
+    """가장 큰 얼굴을 감싸는 정사각 영역. 못 찾으면 None."""
+    import cv2
+    import numpy as np
+
+    scale = min(1.0, DETECT_MAX / max(img.size))
+    small = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))))
+
+    det = face_detector()
+    det.setInputSize((small.width, small.height))
+    _, faces = det.detect(cv2.cvtColor(np.array(small), cv2.COLOR_RGB2BGR))
+    if faces is None or len(faces) == 0:
+        return None
+
+    # 축소본 좌표를 원본 좌표로 되돌린다
+    x, y, w, h = (max(faces, key=lambda f: f[2] * f[3])[:4] / scale).astype(int)
+    # 헤어스타일이 핵심 특징이라 얼굴 박스보다 넉넉히 잡는다(1.8배).
+    side = min(int(max(w, h) * 1.8), img.width, img.height)
+    cx, cy = x + w // 2, y + h // 2
+    left = int(min(max(0, cx - side // 2), img.width - side))
+    top = int(min(max(0, cy - side // 2), img.height - side))
+    return (left, top, left + side, top + side)
+
+
+def prepare(img: Image.Image, size: int = SIZE) -> tuple[Image.Image, bool]:
+    """EXIF 회전 보정 → 얼굴 크롭 → 정사각 리사이즈. (이미지, 얼굴검출여부) 반환."""
+    img = ImageOps.exif_transpose(img).convert("RGB")  # 휴대폰 사진은 회전정보가 EXIF에 있다
+    box = face_box(img)
+    found = box is not None
+    if box is None:
+        side = min(img.size)  # 폴백: 중앙 정사각 크롭
+        box = ((img.width - side) // 2, (img.height - side) // 2)
+        box = (box[0], box[1], box[0] + side, box[1] + side)
+    return img.crop(box).resize((size, size), Image.LANCZOS), found
 
 
 def to_png(img: Image.Image) -> bytes:
@@ -73,9 +115,9 @@ def to_png(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def generate(photo_bytes: bytes, control_scale: float, steps: int) -> tuple[bytes, bytes]:
-    """(결과 PNG, 윤곽선 PNG) 반환. 윤곽선은 무엇이 모델에 들어갔는지 확인용."""
-    photo = to_square(Image.open(io.BytesIO(photo_bytes)).convert("RGB"))
+def generate(photo_bytes: bytes, control_scale: float, steps: int):
+    """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부) 반환."""
+    photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
     control = edge_detector()(photo, scribble=False)
     result = pipeline()(
         prompt=PROMPT,
@@ -85,7 +127,7 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int) -> tuple[byte
         num_inference_steps=steps,
         guidance_scale=7.5,
     ).images[0]
-    return to_png(result), to_png(control)
+    return to_png(result), to_png(control), to_png(photo), face_found
 
 
 st.title("MonSnap 🐲")
@@ -100,6 +142,15 @@ with st.sidebar:
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
     show_edge = st.checkbox("윤곽선 같이 보기", value=True)
+
+st.info(
+    "**이렇게 찍으면 잘 나옵니다**\n"
+    "- 얼굴이 **정면**을 보게 (옆얼굴은 인식되지 않습니다)\n"
+    "- 화면에 **얼굴이 크게** 차게 — 배경이 넓으면 배경 윤곽이 특징으로 섞입니다\n"
+    "- **머리 전체**가 잘리지 않게 — 헤어스타일이 가장 큰 특징입니다\n"
+    "- **밝은 곳**에서, 안경·앞머리로 얼굴을 가리지 않게",
+    icon="📸",
+)
 
 source = st.radio(
     "사진 방법", ["앨범에서 선택", "카메라로 촬영"], horizontal=True, label_visibility="collapsed"
@@ -134,9 +185,11 @@ if uploaded is not None:
             t0 = time.monotonic()
             try:
                 with st.spinner("몬스터 소환 중…"):
-                    result, edge = generate(photo_bytes, control_scale, steps)
+                    result, edge, crop, face_found = generate(photo_bytes, control_scale, steps)
                 st.session_state["result"] = result
                 st.session_state["edge"] = edge
+                st.session_state["crop"] = crop
+                st.session_state["face_found"] = face_found
                 log.info(
                     "generate ok elapsed=%.1fs scale=%.2f steps=%d",
                     time.monotonic() - t0, control_scale, steps,
@@ -151,12 +204,19 @@ if uploaded is not None:
 
         if "result" in st.session_state:
             col2.image(st.session_state["result"], caption="몬스터", use_container_width=True)
-            if show_edge and "edge" in st.session_state:
-                st.image(
-                    st.session_state["edge"],
-                    caption="모델이 받은 윤곽선 (형태 반영 강도가 이걸 얼마나 따를지 결정)",
-                    width=256,
+
+            if not st.session_state.get("face_found", True):
+                st.warning(
+                    "얼굴을 찾지 못해 사진 중앙을 잘라 썼습니다. 정면·밝은 곳에서 "
+                    "얼굴이 크게 나오도록 다시 찍으면 특징이 훨씬 잘 반영됩니다.",
+                    icon="⚠️",
                 )
+
+            if show_edge and "edge" in st.session_state:
+                st.caption("모델이 실제로 받은 입력 — 특징이 여기 안 잡혔으면 사진을 다시 찍는 게 빠릅니다")
+                e1, e2 = st.columns(2)
+                e1.image(st.session_state["crop"], caption="얼굴 크롭", use_container_width=True)
+                e2.image(st.session_state["edge"], caption="윤곽선", use_container_width=True)
             st.download_button(
                 "이미지 저장",
                 data=st.session_state["result"],
