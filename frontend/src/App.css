@@ -1,0 +1,86 @@
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 32px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+h1 {
+  margin: 0;
+  font-size: 40px;
+}
+
+.tagline {
+  margin: 0;
+}
+
+.pick {
+  cursor: pointer;
+  background: var(--accent-bg);
+  color: var(--accent);
+  border: 2px solid var(--accent-border);
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 18px;
+}
+
+.panes {
+  display: flex;
+  gap: 16px;
+  width: 100%;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.panes figure {
+  margin: 0;
+  flex: 1 1 240px;
+  max-width: 340px;
+}
+
+.panes img,
+.placeholder {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  box-sizing: border-box;
+}
+
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  padding: 16px;
+  background: var(--code-bg);
+}
+
+button {
+  cursor: pointer;
+  font-size: 18px;
+  padding: 10px 24px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.download {
+  color: var(--accent);
+}
+
+.error {
+  color: #e05252;
+  margin: 0;
+}
