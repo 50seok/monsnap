@@ -1,2 +1,13 @@
+# torch/torchvision은 CUDA 빌드로 먼저 설치할 것:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# (그냥 pip install torch 하면 CPU 빌드가 깔려서 생성이 수십 배 느려짐)
+torch
+torchvision
+
 streamlit
-google-genai
+diffusers
+transformers
+accelerate
+safetensors
+peft
+controlnet_aux

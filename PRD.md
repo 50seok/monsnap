@@ -161,7 +161,30 @@
 | 7 | Phase 3 브랜딩(오리지널 몬스터 세계관) | Phase 2 완료 후 |
 | 8 | **시드 정책** — 유력안 = **계층 시드**: 얼굴 임베딩(주 키)이 종족·실루엣 결정, 이름 해시(보조)는 색·장식만 결정 + 속성 선택(불/물/풀) 옵션. Phase 1은 이름 제약 없음(이름 바꿔 다중 생성 = 놀이로 수용, 비용은 횟수 제한으로 방어), 계층 시드는 Phase 2~실서비스에서 적용 | Phase 1 샘플 생성 후 |
 
-## 13. 구현 상태 (2026-08-10)
+## 13. 구현 상태 (2026-08-12) — 로컬 생성으로 전환
+
+**결정: 상용 API 포기, 로컬 GPU 생성으로 Phase 1 진행.** 근거:
+- Gemini 이미지 모델은 무료 티어가 **구조적으로 0**(신형 `gemini-3.1-flash-image`까지 전부 `limit: 0`, 2026-08-12 실측). 모델 교체로 우회 불가.
+- 2026-03 정책 개편으로 신규 계정은 **선불 의무**(후불은 Tier 3만), 최소 충전 ₩25,000·환불 불가. GCP $300 크레딧은 "AI Studio Gemini API 비용에 사용 불가"로 명시 제외.
+- 대안 API 조사 결과 fal.ai(FLUX Kontext dev $0.015/장, Nano Banana 재판매 엔드포인트 보유)가 최선이었으나, **팀에 SD1.5 + LoRA + ControlNet 경험이 이미 있어** 로컬 $0 경로의 실현 가능성이 API 결제보다 높다고 판단.
+
+**채택 스택** (팀 보유 기술 3/4 재활용):
+
+| 부품 | 선택 | 팀 경험 |
+|---|---|---|
+| 베이스 | SD1.5 파생 (`lambdalabs/sd-pokemon-diffusers`) | ✅ |
+| 스타일 | UNet LoRA (AdamW) — 우선 공개 LoRA로 검증 후 자체 학습 | ✅ |
+| 형태 유지 | ControlNet softedge (`control_v11p_sd15_softedge`) | ✅ (scribble) |
+| 정체성 | IP-Adapter FaceID — **닮음 미달 시에만 추가** | ❌ |
+
+**§12-4 해소**: 마스코트형↔크리처형은 기획 결정이 아니라 `controlnet_conditioning_scale` 파라미터(0.3 크리처형 ~ 0.9 마스코트형). UI 슬라이더로 노출해 스윕 가능.
+
+- **완료**: `git init` + 초기 커밋(8a013db, Gemini 버전 보존). `.gitignore` 버그 수정 — `.streamlit/secrets.toml` 패턴이 슬래시 때문에 루트에만 적용돼 `streamlit_app/.streamlit/secrets.toml`(실키)이 커밋될 뻔함 → `**/` 로 수정. `app.py`를 로컬 diffusers 파이프라인으로 재작성. PyTorch 2.6.0+cu124 설치, CUDA 인식 확인(RTX 4060 Laptop 8GB, 드라이버 528.92로도 마이너 버전 호환 통과).
+- **검증 중**: 모델 다운로드(~5GB) + 생성 스모크 테스트 + 스케일 스윕.
+- **다음**: ① 실사진으로 닮음 검증(§11 기준: 5명 중 3명) ② 미달 시 IP-Adapter FaceID 추가 ③ 통과 시 자체 LoRA 학습으로 공개 LoRA 교체 ④ Streamlit Cloud 배포는 **불가**(무료 티어 GPU 없음) — 데모는 로컬 시연/녹화로 대체, §8 Phase 1 산출물 수정 필요.
+- **키 상태**: Gemini 실키는 `streamlit_app/.streamlit/secrets.toml`에 남아 있으나 현재 코드 경로에서 미사용(gitignore 확인됨).
+
+### 이전 상태 (2026-08-10)
 
 - **완료**: `streamlit_app/app.py` 작성 — 카메라/앨범 선택 UI, FR-1(파일 검증)·FR-3(결과 표시·PNG 다운로드·재생성)·FR-4(에러 3종: 파일 오류/API 오류/안전필터 차단) 구현. `streamlit_app/.venv`에 의존성 설치 완료.
 - **검증 완료**: Streamlit UI 정상 로드(브라우저로 확인). Gemini API 호출 코드 경로 정상 — SDK 호출이 구글 서버까지 도달해 구조화된 응답을 받음(모델명·프롬프트·`Part.from_bytes` 사용법 전부 정상). 재현 스크립트는 세션 임시 파일이라 소실됨 — 필요 시 `app.py`의 `generate()` 함수 로직 그대로 재작성하면 됨.

@@ -1,20 +1,26 @@
+import io
 import logging
 import time
 
 import streamlit as st
-from google import genai
-from google.genai import types
+from PIL import Image
 
-MODEL = st.secrets.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+# 로컬 생성 스택: SD1.5 파생 모델 + ControlNet softedge(형태 유지)
+# ponytail: 베이스 모델은 secrets로 교체 가능 — LoRA 자체 학습 후 여기만 바꾸면 됨
+BASE_MODEL = st.secrets.get("BASE_MODEL", "lambdalabs/sd-pokemon-diffusers")
+CONTROLNET = "lllyasviel/control_v11p_sd15_softedge"
+SIZE = 512  # SD1.5 네이티브 해상도
+
 PROMPT = (
-    "Transform the person in this photo into a cute, round, original monster "
-    "creature character, like a caricature: keep their distinctive features "
-    "(hairstyle, glasses, face shape, expression) clearly recognizable. "
-    "Vibrant colors, anime-inspired, full body, clean white background. "
-    "Original design only - do not imitate any copyrighted characters."
+    "a cute original monster creature, chibi, big expressive eyes, "
+    "vibrant colors, simple clean background, character art"
+)
+# "human/person" 억제 = 윤곽은 ControlNet이 주고 내용물은 몬스터로 채우게 만드는 핵심
+NEG_PROMPT = (
+    "human, person, realistic face, photograph, text, watermark, "
+    "blurry, deformed, extra limbs, ugly"
 )
 MAX_UPLOAD = 10 * 1024 * 1024
-TIMEOUT_MS = 150_000  # PRD §5: 클라이언트 타임아웃 150초
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("monsnap")
@@ -22,36 +28,82 @@ log = logging.getLogger("monsnap")
 st.set_page_config(page_title="MonSnap", page_icon="🐲")
 
 
-class SafetyBlockedError(Exception):
-    pass
-
-
-@st.cache_resource
-def client() -> genai.Client:
-    return genai.Client(
-        api_key=st.secrets["GEMINI_API_KEY"],
-        http_options=types.HttpOptions(timeout=TIMEOUT_MS),
+@st.cache_resource(show_spinner="모델 로딩 중… (최초 1회 ~5GB 다운로드)")
+def pipeline():
+    import torch
+    from diffusers import (
+        ControlNetModel,
+        StableDiffusionControlNetPipeline,
+        UniPCMultistepScheduler,
     )
 
-
-def generate(photo_bytes: bytes, mime_type: str) -> bytes:
-    """생성 성공 시 PNG 바이트 반환. 실패 시 예외."""
-    resp = client().models.generate_content(
-        model=MODEL,
-        contents=[types.Part.from_bytes(data=photo_bytes, mime_type=mime_type), PROMPT],
+    controlnet = ControlNetModel.from_pretrained(CONTROLNET, torch_dtype=torch.float16)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        BASE_MODEL,
+        controlnet=controlnet,
+        torch_dtype=torch.float16,
+        safety_checker=None,  # 얼굴 입력에서 오탐이 잦고 VRAM 1.2GB를 더 먹는다
+        requires_safety_checker=False,
     )
-    cand = resp.candidates[0] if resp.candidates else None
-    parts = cand.content.parts if cand and cand.content else None
-    for part in parts or []:
-        if part.inline_data and part.inline_data.data:
-            return part.inline_data.data
-    raise SafetyBlockedError()  # 응답은 왔지만 이미지가 없음 = 안전 필터 차단 (FR-4)
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    # ponytail: VRAM 8GB — 전체 상주 대신 레이어 단위 오프로드. 더 빠르게 하려면
+    # VRAM 12GB 이상에서 pipe.to("cuda")로 교체.
+    pipe.enable_model_cpu_offload()
+    return pipe
+
+
+@st.cache_resource(show_spinner=False)
+def edge_detector():
+    from controlnet_aux import HEDdetector
+
+    return HEDdetector.from_pretrained("lllyasviel/Annotators")
+
+
+def to_square(img: Image.Image, size: int = SIZE) -> Image.Image:
+    """짧은 변 기준 리사이즈 후 중앙 크롭. 인물 사진은 얼굴이 중앙이라 이걸로 충분."""
+    scale = size / min(img.size)
+    img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    left, top = (img.width - size) // 2, (img.height - size) // 2
+    return img.crop((left, top, left + size, top + size))
+
+
+def to_png(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def generate(photo_bytes: bytes, control_scale: float, steps: int) -> tuple[bytes, bytes]:
+    """(결과 PNG, 윤곽선 PNG) 반환. 윤곽선은 무엇이 모델에 들어갔는지 확인용."""
+    photo = to_square(Image.open(io.BytesIO(photo_bytes)).convert("RGB"))
+    control = edge_detector()(photo, scribble=False)
+    result = pipeline()(
+        prompt=PROMPT,
+        negative_prompt=NEG_PROMPT,
+        image=control,
+        controlnet_conditioning_scale=control_scale,
+        num_inference_steps=steps,
+        guidance_scale=7.5,
+    ).images[0]
+    return to_png(result), to_png(control)
 
 
 st.title("MonSnap 🐲")
 st.caption("사진을 찍으면 나만의 몬스터가 태어납니다")
 
-source = st.radio("사진 방법", ["앨범에서 선택", "카메라로 촬영"], horizontal=True, label_visibility="collapsed")
+with st.sidebar:
+    st.subheader("생성 설정")
+    # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
+    control_scale = st.slider(
+        "형태 반영 강도", 0.0, 1.2, 0.6, 0.05,
+        help="낮음 = 크리처형(형태 힌트만) · 높음 = 마스코트형(사람 윤곽 뚜렷)",
+    )
+    steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
+    show_edge = st.checkbox("윤곽선 같이 보기", value=True)
+
+source = st.radio(
+    "사진 방법", ["앨범에서 선택", "카메라로 촬영"], horizontal=True, label_visibility="collapsed"
+)
 uploaded = (
     st.file_uploader("사진 선택", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
     if source == "앨범에서 선택"
@@ -81,20 +133,30 @@ if uploaded is not None:
         if st.button(label, type="primary"):
             t0 = time.monotonic()
             try:
-                with st.spinner("몬스터 소환 중… (최대 2분)"):
-                    st.session_state["result"] = generate(photo_bytes, mime_type)
-                log.info("generate ok elapsed=%.1fs", time.monotonic() - t0)
-            except SafetyBlockedError:
-                st.session_state.pop("result", None)
-                log.info("generate blocked elapsed=%.1fs", time.monotonic() - t0)
-                st.error("이 사진은 생성할 수 없습니다. 다른 사진을 선택해 주세요.")
-            except Exception:
+                with st.spinner("몬스터 소환 중…"):
+                    result, edge = generate(photo_bytes, control_scale, steps)
+                st.session_state["result"] = result
+                st.session_state["edge"] = edge
+                log.info(
+                    "generate ok elapsed=%.1fs scale=%.2f steps=%d",
+                    time.monotonic() - t0, control_scale, steps,
+                )
+            except Exception as exc:  # FR-4
                 st.session_state.pop("result", None)
                 log.exception("generate failed elapsed=%.1fs", time.monotonic() - t0)
-                st.error("일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+                if "out of memory" in str(exc).lower():
+                    st.error("GPU 메모리가 부족합니다. 스텝 수를 줄이거나 다른 앱을 종료해 주세요.")
+                else:
+                    st.error("생성에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
         if "result" in st.session_state:
             col2.image(st.session_state["result"], caption="몬스터", use_container_width=True)
+            if show_edge and "edge" in st.session_state:
+                st.image(
+                    st.session_state["edge"],
+                    caption="모델이 받은 윤곽선 (형태 반영 강도가 이걸 얼마나 따를지 결정)",
+                    width=256,
+                )
             st.download_button(
                 "이미지 저장",
                 data=st.session_state["result"],
@@ -104,4 +166,4 @@ if uploaded is not None:
             st.caption("마음에 안 드시면 '다시 생성'을 눌러 보세요 — 매번 다른 결과가 나옵니다.")
 
 st.divider()
-st.caption("생성을 위해 사진이 구글 Gemini API로 전송됩니다. 서버에는 저장되지 않습니다.")
+st.caption("사진은 이 PC 안에서만 처리됩니다. 외부로 전송되지 않습니다.")
