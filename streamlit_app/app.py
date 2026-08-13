@@ -277,7 +277,9 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int,
         controlnet_conditioning_scale=control_scale,
         ip_adapter_image_embeds=[emb],
         num_inference_steps=steps,
-        guidance_scale=7.5,
+        # 9.0 = 기본(7.5)보다 강한 프롬프트·네거티브 견인 — "human, person" 억제가
+        # 세져 시드가 바뀌어도 사람 캐리커처로 안 떨어진다(probe4 실측)
+        guidance_scale=9.0,
         generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
     return to_png(result), to_png(control), to_png(photo), face_found
@@ -290,17 +292,17 @@ with st.sidebar:
     st.subheader("생성 설정")
     # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
     control_scale = st.slider(
-        "형태 반영 강도", 0.0, 1.2, 0.4, 0.05,
-        help="0.3=크리처에 가까움 · 0.4=권장(균형) · 0.5↑=닮지만 사람 구조가 남음",
+        "형태 반영 강도", 0.0, 1.2, 0.3, 0.05,
+        help="0.3=권장(크리처) · 0.4↑=닮음이 늘지만 사람 캐리커처로 떨어질 수 있음",
     )
-    # probe3 실측 균형점: L1.3 × F0.35 × C0.4 — 헤어스타일이 귀·색 패치로 은유되는
-    # 크리처가 나오는 지점. 자체 LoRA(rank16 2000스텝)는 견인력이 약해 1.0으론 부족.
+    # probe4(시드 6개 강건성) 실측: L1.45 × F0.3 × C0.3 × CFG9에서 6/6 크리처.
+    # 이전 균형점(L1.3 F0.35 C0.4)은 시드에 따라 사람 캐리커처로 뒤집혔다(사용자 재현).
     lora_weight = st.slider(
-        "스타일 강도", 0.0, 1.5, 1.3, 0.05,
+        "스타일 강도", 0.0, 1.5, 1.45, 0.05,
         help="크리처 그림체로 미는 힘 — 약하면 사람 그림이 됩니다",
     )
     faceid_scale = st.slider(
-        "닮음 강도", 0.0, 1.0, 0.35, 0.05,
+        "닮음 강도", 0.0, 1.0, 0.3, 0.05,
         help="원본 얼굴을 반영하는 힘 — 세면 사람에 가까워집니다",
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
