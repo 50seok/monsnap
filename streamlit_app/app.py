@@ -32,7 +32,9 @@ SIZE = 512  # SD1.5 네이티브 해상도
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
 def build_prompt(feature: str | None, palette: str) -> str:
     feat = f"{feature}, " if feature else ""
-    return (f"cutemon, a cute round {palette} creature, {feat}"
+    # "full body ... standing, short arms and legs" = 상반신 블롭 방지(probe6과 세트)
+    return (f"cutemon, full body of a cute round {palette} creature, standing, "
+            f"short arms and legs, {feat}"
             "big sparkling eyes, smiling face, chubby simple body, bright cheerful colors")
 
 
@@ -180,7 +182,14 @@ def mask_background(photo: Image.Image, edge: Image.Image) -> Image.Image:
 
     masked = Image.new("RGB", edge.size, "black")
     masked.paste(edge, (0, 0), band_mask.resize(edge.size))
-    return masked
+
+    # 55%로 축소해 상단 배치 — 밴드가 캔버스를 꽉 채우면 상반신 클로즈업 블롭이 되고
+    # (실제 포켓몬 원본과 비교했을 때 어색함의 근본 원인), 아래 공간을 비워주면
+    # 모델이 팔다리 달린 전신을 그린다(probe6 실측). 머리 실루엣은 그대로 유지된다.
+    small = masked.resize((int(SIZE * 0.55), int(SIZE * 0.55)))
+    out = Image.new("RGB", (SIZE, SIZE), "black")
+    out.paste(small, ((SIZE - small.width) // 2, 30))
+    return out
 
 
 @st.cache_resource(show_spinner=False)
