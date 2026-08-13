@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import streamlit as st
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 # 모듈형 스택: 표준 SD1.5 + 스타일 LoRA + IP-Adapter FaceID + ControlNet lineart.
 # 풀 파인튜닝 베이스(sd-pokemon-diffusers)는 FaceID를 막는다는 게 실측 확인돼
@@ -19,23 +19,21 @@ STYLE_LORA = st.secrets.get(
     str(_LOCAL_LORA) if (_LOCAL_LORA / "pytorch_lora_weights.safetensors").exists()
     else "pcuenq/pokemon-lora",
 )
-# lineart > softedge (실측). softedge(HED)는 선이 뭉툭해서 눈매·입술·헤어라인이
-# 소실되고 강도를 올리면 뭉개져 붕괴한다. lineart는 쌍꺼풀·코 윤곽까지 선으로 남고
-# 강도를 올려도 붕괴 대신 "사람에 가까워지는" 방향이라 제어 구간이 넓다(0.5~0.8).
-CONTROLNET = "lllyasviel/control_v11p_sd15_lineart"
 SIZE = 512  # SD1.5 네이티브 해상도
+# 레퍼런스 원형 후보 = 큐레이션된 귀여운 200장. 사람 얼굴과 CLIP 유사도 top-1 한 마리를
+# img2img 밑그림으로 써서 "여러 포켓몬 평균"이 만들던 키메라를 없앤다(probe7, 사용자 제안).
+# ⚠ IP: 특정 원형에 앵커하므로 실서비스 전 클린 데이터로 교체 필수(PRD §10).
+REF_DIR = Path(__file__).parent.parent / "dataset" / "cute"
 
-# 원형 모드(probe5): 사람 특징을 전부 이식하지 않고, CLIP으로 고른 대표 특징 1개만
-# 프롬프트 단어로 주입해 포켓몬 원형에 가깝게 만든다. 특징의 텍스트화는 원래 PRD §6.2에서
-# "정체성 손실"로 배제했지만, 목표가 정체성→원형으로 바뀐 지금은 그 일반화가 곧 원하는 효과다.
-# 트리거 "cutemon" = 자체 LoRA 학습 캡션의 첫 토큰(빼면 카툰화된 사람이 나옴 — probe2·3 실측).
+# 레퍼런스 합성 모드 프롬프트. 특징 구절을 맨 앞에 — CLIP 텍스트 인코더는 앞 토큰이
+# 강해서, 뒤에 두면 img2img가 레퍼런스에 없는 사물(안경 등)을 안 그린다(probe7b·c 실측).
+# 트리거 "cutemon" = 자체 LoRA 학습 캡션의 첫 토큰(빼면 카툰화된 사람 — probe2·3 실측).
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
 def build_prompt(feature: str | None, palette: str) -> str:
     feat = f"{feature}, " if feature else ""
-    # "full body ... standing, short arms and legs" = 상반신 블롭 방지(probe6과 세트)
-    return (f"cutemon, full body of a cute round {palette} creature, standing, "
-            f"short arms and legs, {feat}"
-            "big sparkling eyes, smiling face, chubby simple body, bright cheerful colors")
+    return (f"cutemon creature {feat}full body, standing, "
+            f"a cute round {palette} creature, big sparkling eyes, smiling face, "
+            "chubby simple body, bright cheerful colors")
 
 
 # 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
@@ -49,11 +47,18 @@ TYPES = [
 ]
 
 # CLIP 제로샷 특징 후보: (프롬프트 구절, 한국어 표시, 긍정 문장, 부정 문장)
+# 점수 = P(긍정) - P(부정) 마진. 전 후보 중 최고 마진 1개만 채택(임계 0.12 미달 시 없음).
 FEATURES = [
     ("wearing tiny round glasses", "안경", "a person wearing glasses", "a person without glasses"),
     ("with a fluffy beard", "수염", "a person with a beard", "a clean-shaven person"),
     ("with long flowing hair", "긴 머리", "a person with long hair", "a person with short hair"),
     ("with spiky hair", "뻗친 머리", "a person with spiky messy hair", "a person with neat flat hair"),
+    ("with big round eyes", "큰 눈", "a person with big round eyes", "a person with small narrow eyes"),
+    ("with narrow sleepy eyes", "가는 눈", "a person with small narrow eyes", "a person with big round eyes"),
+    ("with a big round nose", "큰 코", "a person with a big prominent nose", "a person with a small flat nose"),
+    ("with a wide smiling mouth", "큰 입", "a person with a wide big mouth", "a person with a small mouth"),
+    ("with chubby cheeks", "통통한 볼", "a person with chubby round cheeks", "a person with a slim narrow face"),
+    ("with thick bold eyebrows", "진한 눈썹", "a person with thick dark eyebrows", "a person with thin light eyebrows"),
 ]
 
 # 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
@@ -74,16 +79,10 @@ st.set_page_config(page_title="MonSnap", page_icon="🐲")
 @st.cache_resource(show_spinner="모델 로딩 중… (최초 1회 ~5GB 다운로드)")
 def pipeline():
     import torch
-    from diffusers import (
-        ControlNetModel,
-        StableDiffusionControlNetPipeline,
-        UniPCMultistepScheduler,
-    )
+    from diffusers import StableDiffusionImg2ImgPipeline, UniPCMultistepScheduler
 
-    controlnet = ControlNetModel.from_pretrained(CONTROLNET, torch_dtype=torch.float16)
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         BASE_MODEL,
-        controlnet=controlnet,
         torch_dtype=torch.float16,
         safety_checker=None,  # 얼굴 입력에서 오탐이 잦고 VRAM 1.2GB를 더 먹는다
         requires_safety_checker=False,
@@ -138,61 +137,6 @@ def face_embedder():
 
 
 @st.cache_resource(show_spinner=False)
-def edge_detector():
-    from controlnet_aux import LineartDetector
-
-    return LineartDetector.from_pretrained("lllyasviel/Annotators")
-
-
-@st.cache_resource(show_spinner=False)
-def bg_remover():
-    from rembg import new_session
-
-    return new_session("u2net")
-
-
-def mask_background(photo: Image.Image, edge: Image.Image) -> Image.Image:
-    """실루엣 밴드만 남긴다 — 인물 경계 주변 선만 통과, 얼굴 내부 선은 버린다.
-
-    전신 마스크(인물 내부 전부 통과)로 하면 눈썹·코·인중·입술 선이 ControlNet에
-    들어가 사람 얼굴 배치가 강제된다(= "사람 캐리커처" 문제). 경계 밴드만 남기면
-    머리·헤어 실루엣은 유지하면서 크리처가 자기 얼굴을 갖는다(probe5 실측).
-    안경 같은 내부 특징은 CLIP 특징 주입(프롬프트)이 담당한다.
-    """
-    import numpy as np
-    from rembg import remove
-
-    alpha = remove(photo, session=bg_remover()).getchannel("A")
-    alpha = alpha.filter(ImageFilter.GaussianBlur(4))  # 경계 계단 방지
-
-    # rembg는 '인물 전경'을 남기므로 목에 두른 수건·옷이 그대로 통과한다. 크롭이
-    # 얼굴 1.8배 정사각이라 턱은 대략 높이의 0.78 지점 — 그 아래를 페이드아웃.
-    arr = np.array(alpha, dtype=np.float32)
-    height = arr.shape[0]
-    cut, fade = int(height * 0.80), max(1, int(height * 0.10))
-    ramp = np.ones(height, dtype=np.float32)
-    ramp[cut : cut + fade] = np.linspace(1.0, 0.0, min(fade, height - cut))
-    ramp[cut + fade :] = 0.0
-    alpha = Image.fromarray((arr * ramp[:, None]).astype(np.uint8))
-
-    # 실루엣 밴드 = 팽창 - 침식 (경계 주변 ~13px 링)
-    band = np.array(alpha.filter(ImageFilter.MaxFilter(13)), np.float32) - \
-        np.array(alpha.filter(ImageFilter.MinFilter(13)), np.float32)
-    band_mask = Image.fromarray(np.clip(band, 0, 255).astype(np.uint8))
-
-    masked = Image.new("RGB", edge.size, "black")
-    masked.paste(edge, (0, 0), band_mask.resize(edge.size))
-
-    # 55%로 축소해 상단 배치 — 밴드가 캔버스를 꽉 채우면 상반신 클로즈업 블롭이 되고
-    # (실제 포켓몬 원본과 비교했을 때 어색함의 근본 원인), 아래 공간을 비워주면
-    # 모델이 팔다리 달린 전신을 그린다(probe6 실측). 머리 실루엣은 그대로 유지된다.
-    small = masked.resize((int(SIZE * 0.55), int(SIZE * 0.55)))
-    out = Image.new("RGB", (SIZE, SIZE), "black")
-    out.paste(small, ((SIZE - small.width) // 2, 30))
-    return out
-
-
-@st.cache_resource(show_spinner=False)
 def clip_model():
     from transformers import CLIPModel, CLIPProcessor
 
@@ -200,19 +144,56 @@ def clip_model():
             CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32"))
 
 
-def pick_traits(crop: Image.Image) -> tuple[str | None, str | None]:
-    """CLIP 제로샷으로 대표 특징 1개를 고른다(최대 마진, 미달 시 None = 순수 원형)."""
+def pick_traits(crop: Image.Image):
+    """CLIP 제로샷 특징 점수판. (채택 구절, 채택 한국어, [(한국어, 마진점수)] 내림차순) 반환.
+
+    점수 = P(긍정문장) - P(부정문장) 마진. 최고 마진 1개만 채택, 0.12 미달이면 순수 원형.
+    """
+    import torch
+
+    model, proc = clip_model()
+    scores = []
+    with torch.no_grad():
+        for phrase, ko, pos, neg in FEATURES:
+            inp = proc(text=[pos, neg], images=crop, return_tensors="pt", padding=True)
+            p = model(**inp).logits_per_image.softmax(-1)[0]
+            scores.append((phrase, ko, float(p[0] - p[1])))
+    scores.sort(key=lambda s: s[2], reverse=True)
+    best = scores[0] if scores[0][2] > 0.12 else None
+    return (best[0] if best else None, best[1] if best else None,
+            [(ko, m) for _, ko, m in scores])
+
+
+def _clip_image_features(imgs):
+    """CLIP 이미지 임베딩(정규화). transformers 5.x는 get_image_features가
+    출력 객체를 반환하므로 vision_model→visual_projection을 직접 탄다."""
     import torch
 
     model, proc = clip_model()
     with torch.no_grad():
-        best, best_ko, margin = None, None, 0.12  # 최소 확신 마진
-        for phrase, ko, pos, neg in FEATURES:
-            inp = proc(text=[pos, neg], images=crop, return_tensors="pt", padding=True)
-            p = model(**inp).logits_per_image.softmax(-1)[0]
-            if p[0] - p[1] > margin:
-                best, best_ko, margin = phrase, ko, p[0] - p[1]
-    return best, best_ko
+        inp = proc(images=imgs, return_tensors="pt")
+        vis = model.vision_model(pixel_values=inp["pixel_values"])
+        f = model.visual_projection(vis.pooler_output)
+        return f / f.norm(dim=-1, keepdim=True)
+
+
+@st.cache_resource(show_spinner="원형 도감 인덱싱 중… (최초 1회 ~20초)")
+def ref_index():
+    """레퍼런스 200장의 CLIP 임베딩 인덱스. (경로 리스트, 임베딩 텐서)"""
+    import torch
+
+    paths = sorted(REF_DIR.glob("*.png"))
+    embs = [_clip_image_features([Image.open(p).convert("RGB") for p in paths[i:i + 64]])
+            for i in range(0, len(paths), 64)]
+    return paths, torch.cat(embs)
+
+
+def match_reference(crop: Image.Image) -> tuple[Image.Image, float]:
+    """사람 얼굴과 CLIP 유사도 top-1 원형 한 마리. (512px 이미지, 유사도) 반환."""
+    paths, embs = ref_index()
+    sim = (embs @ _clip_image_features([crop]).T).squeeze(1)
+    idx = int(sim.argmax())
+    return Image.open(paths[idx]).convert("RGB").resize((SIZE, SIZE)), float(sim[idx])
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -303,26 +284,29 @@ def identity(photo_bytes: bytes, photo: Image.Image):
     return emb.to(dtype=torch.float16, device="cuda"), normed.tobytes()
 
 
-def generate(photo_bytes: bytes, control_scale: float, steps: int,
+def generate(photo_bytes: bytes, strength: float, steps: int,
              lora_weight: float, faceid_scale: float, name: str):
-    """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부, 카드정보 dict) 반환."""
+    """(결과 PNG, 레퍼런스 PNG, 전처리 입력 PNG, 얼굴검출여부, 카드정보 dict) 반환.
+
+    레퍼런스 합성(사용자 설계): ① 특징 1개 인식(CLIP 점수) → ② 가장 닮은 원형
+    1마리 선택 → ③ img2img로 특징을 배합. 단일 원형 밑그림이라 키메라가 안 나온다.
+    """
     import torch
 
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
-    control = mask_background(photo, edge_detector()(photo))
     emb, seed_src = identity(photo_bytes, photo)
-    feature, feature_ko = pick_traits(photo)
+    feature, feature_ko, scores = pick_traits(photo)
+    ref, ref_sim = match_reference(photo)
 
-    # 계층 시드(PRD §12-8 완성형): 얼굴 임베딩(주) → 시드(종족·실루엣),
-    # 이름(보조) → 속성(색·장식)만. 이름을 바꿔도 실루엣은 유지되고 색만 바뀐다.
-    # ponytail: 사진이 다르면 임베딩도 달라 시드가 바뀐다 — 인물 단위 고정은 임베딩
-    # 저장소가 필요한 Phase 2 과제. 사진 단위 재현성 + FaceID의 정체성 견인으로 갈음.
+    # 계층 시드(PRD §12-8 완성형): 얼굴 임베딩(주) → 시드·레퍼런스(종족),
+    # 이름(보조) → 속성(색·장식)만. 이름을 바꿔도 종족은 유지되고 색만 바뀐다.
     seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:4], "big")
     type_src = name.strip().encode() if name.strip() else seed_src
     type_ko, type_rgb, palette = TYPES[
         int.from_bytes(hashlib.sha256(type_src).digest()[:4], "big") % len(TYPES)]
     info = {
         "traits": feature_ko or "없음 (순수 원형)",
+        "scores": scores, "ref_sim": ref_sim,
         "type_ko": type_ko, "type_rgb": type_rgb,
         "dex": seed % 1000, "name": name.strip(),
     }
@@ -341,8 +325,8 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int,
     result = pipe(
         prompt=build_prompt(feature, palette),
         negative_prompt=NEG_PROMPT,
-        image=control,
-        controlnet_conditioning_scale=control_scale,
+        image=ref,
+        strength=strength,
         ip_adapter_image_embeds=[emb],
         num_inference_steps=steps,
         # 9.0 = 기본(7.5)보다 강한 프롬프트·네거티브 견인 — "human, person" 억제가
@@ -350,7 +334,7 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int,
         guidance_scale=9.0,
         generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
-    return to_png(result), to_png(control), to_png(photo), face_found, info
+    return to_png(result), to_png(ref), to_png(photo), face_found, info
 
 
 def make_card(result_png: bytes, info: dict) -> bytes:
@@ -384,11 +368,11 @@ st.caption("사진을 찍으면 나만의 몬스터가 태어납니다")
 
 with st.sidebar:
     st.subheader("생성 설정")
-    # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
-    # 원형 모드(probe5): 실루엣 밴드라 형태 강도를 올려도 사람 얼굴이 안 들어온다.
-    control_scale = st.slider(
-        "실루엣 반영 강도", 0.0, 1.2, 0.5, 0.05,
-        help="머리·헤어 외곽선을 따르는 힘 — 얼굴 내부는 어차피 크리처가 자기 걸 그립니다",
+    # probe7b·c 실측: 0.7 = 원형의 몸 구조는 유지하면서 색·특징이 갈아입혀지는 지점.
+    # 0.5 이하면 원형 복제에 가까워지고(IP 리스크), 0.9면 원형 앵커가 사라진다.
+    strength = st.slider(
+        "변신 정도", 0.5, 0.9, 0.7, 0.05,
+        help="낮으면 매칭된 원형 그대로, 높으면 원형에서 멀어집니다",
     )
     lora_weight = st.slider(
         "스타일 강도", 0.0, 1.5, 1.45, 0.05,
@@ -398,8 +382,8 @@ with st.sidebar:
         "닮음 강도", 0.0, 1.0, 0.2, 0.05,
         help="원본 얼굴 분위기를 반영하는 힘 — 세면 사람에 가까워집니다",
     )
-    steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
-    show_edge = st.checkbox("윤곽선 같이 보기", value=True)
+    steps = st.slider("스텝 수", 10, 40, 30, 5, help="높을수록 느리고 정교함")
+    show_debug = st.checkbox("매칭 과정 보기", value=True)
 
 st.info(
     "**이렇게 찍으면 잘 나옵니다**\n"
@@ -449,18 +433,18 @@ if uploaded is not None:
             t0 = time.monotonic()
             try:
                 with st.spinner("몬스터 소환 중…"):
-                    result, edge, crop, face_found, info = generate(
-                        photo_bytes, control_scale, steps, lora_weight, faceid_scale, name
+                    result, ref, crop, face_found, info = generate(
+                        photo_bytes, strength, steps, lora_weight, faceid_scale, name
                     )
                 st.session_state["result"] = result
-                st.session_state["edge"] = edge
+                st.session_state["ref"] = ref
                 st.session_state["crop"] = crop
                 st.session_state["face_found"] = face_found
                 st.session_state["info"] = info
                 st.session_state["card"] = make_card(result, info)
                 log.info(
-                    "generate ok elapsed=%.1fs scale=%.2f lora=%.2f face=%.2f steps=%d type=%s",
-                    time.monotonic() - t0, control_scale, lora_weight, faceid_scale, steps,
+                    "generate ok elapsed=%.1fs strength=%.2f lora=%.2f face=%.2f steps=%d type=%s",
+                    time.monotonic() - t0, strength, lora_weight, faceid_scale, steps,
                     info["type_ko"],
                 )
             except Exception as exc:  # FR-4
@@ -484,11 +468,15 @@ if uploaded is not None:
                     icon="⚠️",
                 )
 
-            if show_edge and "edge" in st.session_state:
-                st.caption("모델이 실제로 받은 입력 — 특징이 여기 안 잡혔으면 사진을 다시 찍는 게 빠릅니다")
+            if show_debug and "ref" in st.session_state:
+                i = st.session_state["info"]
+                st.caption("매칭 과정 — ① 얼굴 → ② 가장 닮은 원형 1마리 → ③ 특징 배합")
                 e1, e2 = st.columns(2)
                 e1.image(st.session_state["crop"], caption="얼굴 크롭", use_container_width=True)
-                e2.image(st.session_state["edge"], caption="윤곽선", use_container_width=True)
+                e2.image(st.session_state["ref"],
+                         caption=f"매칭된 원형 (유사도 {i['ref_sim']:.2f})", use_container_width=True)
+                score_txt = " · ".join(f"{ko} {m:+.2f}" for ko, m in i["scores"][:4])
+                st.caption(f"특징 점수(상위 4): {score_txt} — 0.12 이상 최고점만 반영")
             if "card" in st.session_state:
                 st.image(st.session_state["card"], caption="도감 카드", width=360)
             b1, b2 = st.columns(2)
