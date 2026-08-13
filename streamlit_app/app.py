@@ -41,9 +41,11 @@ def build_prompt(feature: str | None, palette: str) -> str:
     # 얼굴 구절("cute simple face, round dot eyes, tiny smiling mouth")을 앞에 고정 —
     # v3에 섞인 무생물형 포켓몬의 '얼굴 없는 모드'를 차단(probe9, 네거티브 faceless와 세트).
     # 특징은 중간 위치로 강등 — 맨 앞에 두면 안경 하나가 디자인 전체를 지배한다(사용자 피드백).
+    # "a tiny clean simple smile, clean thin lineart": 512px에서 입이 작은 영역이라
+    # 선이 뭉개지던 문제 — 이 어휘로 깨끗한 곡선 미소가 나온다(probe10, 정제 패스 불필요)
     return ("cutemon creature, full body, standing, "
             f"a cute round {palette} creature with a cute simple face, "
-            f"round dot eyes, tiny smiling mouth, {feat}"
+            f"round dot eyes, a tiny clean simple smile, clean thin lineart, {feat}"
             "chubby simple body, flat colors")
 
 
@@ -82,7 +84,8 @@ NEG_PROMPT = (
     "human, person, human face, realistic face, photograph, text, watermark, "
     "blurry, deformed, extra limbs, ugly, "
     "realistic eyes, detailed iris, human eyes, "
-    "faceless, no face, mechanical, robot, pokeball, orb, machine"
+    "faceless, no face, mechanical, robot, pokeball, orb, machine, "
+    "messy mouth, smudged face, distorted mouth, extra mouth, noisy lines"
 )
 MAX_UPLOAD = 10 * 1024 * 1024
 
