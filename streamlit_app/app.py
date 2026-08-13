@@ -10,24 +10,26 @@ from PIL import Image, ImageFilter, ImageOps
 # 모듈형 스택: 표준 SD1.5 + 스타일 LoRA + IP-Adapter FaceID + ControlNet lineart.
 # 풀 파인튜닝 베이스(sd-pokemon-diffusers)는 FaceID를 막는다는 게 실측 확인돼
 # (PRD §13) 베이스는 순정으로 두고 스타일은 LoRA로 얹는다.
-# ponytail: 둘 다 secrets로 교체 가능 — 자체 학습 LoRA 완성 시 STYLE_LORA만 교체,
-# 구 모놀리식 경로로 롤백하려면 BASE_MODEL=lambdalabs/sd-pokemon-diffusers + STYLE_LORA="".
+# 기본 LoRA = 자체 학습 v1(트리거 cutemon, 색 보존 캡션). 가중치는 커밋 금지(*.safetensors)라
+# 파일이 없는 환경에선 공개 LoRA로 폴백 — 그땐 PROMPT 트리거를 "pokemon"으로 맞출 것.
 BASE_MODEL = st.secrets.get("BASE_MODEL", "stable-diffusion-v1-5/stable-diffusion-v1-5")
-STYLE_LORA = st.secrets.get("STYLE_LORA", "pcuenq/pokemon-lora")
+_LOCAL_LORA = Path(__file__).parent / "models" / "style_lora"
+STYLE_LORA = st.secrets.get(
+    "STYLE_LORA",
+    str(_LOCAL_LORA) if (_LOCAL_LORA / "pytorch_lora_weights.safetensors").exists()
+    else "pcuenq/pokemon-lora",
+)
 # lineart > softedge (실측). softedge(HED)는 선이 뭉툭해서 눈매·입술·헤어라인이
 # 소실되고 강도를 올리면 뭉개져 붕괴한다. lineart는 쌍꺼풀·코 윤곽까지 선으로 남고
 # 강도를 올려도 붕괴 대신 "사람에 가까워지는" 방향이라 제어 구간이 넓다(0.5~0.8).
 CONTROLNET = "lllyasviel/control_v11p_sd15_lineart"
 SIZE = 512  # SD1.5 네이티브 해상도
 
-# "monster"는 절대 넣지 말 것. 학습 데이터(pokemon-blip-captions)는 BLIP 자동 캡션이라
-# 무서운 포켓몬들이 "a monster"/"a demon"으로 캡션됐다. 그래서 이 단어 하나로 악타입
-# 클러스터가 소환되고, "cute"를 붙여도 못 이긴다(실측 확인).
-# 반대로 "a drawing of a ... pokemon"은 학습 캡션의 지배 패턴 = LoRA 트리거.
-# 이 어휘가 없으면 같은 가중치에서도 "카툰화된 사람"이 나온다(probe2 실측 — 셀 A vs B).
-# 자체 LoRA 학습 시엔 고유 트리거 토큰으로 교체할 것(IP 어휘 배제, PRD §10).
+# 트리거 "cutemon" = 자체 LoRA 학습 캡션의 첫 토큰. 이 단어가 스타일을 발동시킨다 —
+# 트리거 없는 프롬프트는 같은 가중치에서도 "카툰화된 사람"이 나온다(probe2·probe3 실측).
+# "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터를 소환 — 이전 실측).
 PROMPT = (
-    "a drawing of a cute round pokemon, big sparkling eyes, smiling face, "
+    "cutemon, a cute round creature, big sparkling eyes, smiling face, "
     "chubby simple body, bright cheerful colors"
 )
 # 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
@@ -288,17 +290,17 @@ with st.sidebar:
     st.subheader("생성 설정")
     # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
     control_scale = st.slider(
-        "형태 반영 강도", 0.0, 1.2, 0.5, 0.05,
-        help="0.35=크리처에 가까움 · 0.5=권장(균형) · 0.65=닮지만 사람 구조가 남음",
+        "형태 반영 강도", 0.0, 1.2, 0.4, 0.05,
+        help="0.3=크리처에 가까움 · 0.4=권장(균형) · 0.5↑=닮지만 사람 구조가 남음",
     )
-    # PRD §13 작업 2의 답(probe2 실측): 크리처화는 LoRA 가중치보다 트리거 어휘와
-    # ControlNet 완화가 결정한다. LoRA는 1.0이면 충분(1.2와 차이 없음).
+    # probe3 실측 균형점: L1.3 × F0.35 × C0.4 — 헤어스타일이 귀·색 패치로 은유되는
+    # 크리처가 나오는 지점. 자체 LoRA(rank16 2000스텝)는 견인력이 약해 1.0으론 부족.
     lora_weight = st.slider(
-        "스타일 강도", 0.0, 1.2, 1.0, 0.05,
+        "스타일 강도", 0.0, 1.5, 1.3, 0.05,
         help="크리처 그림체로 미는 힘 — 약하면 사람 그림이 됩니다",
     )
     faceid_scale = st.slider(
-        "닮음 강도", 0.0, 1.0, 0.45, 0.05,
+        "닮음 강도", 0.0, 1.0, 0.35, 0.05,
         help="원본 얼굴을 반영하는 힘 — 세면 사람에 가까워집니다",
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")

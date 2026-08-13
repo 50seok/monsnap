@@ -175,12 +175,19 @@
   결정론·이름 변형 모두 스모크 테스트로 검증(같은 입력 = 동일 PNG 바이트).
   한계: 같은 인물의 **다른 사진**은 임베딩이 달라 시드가 다름 — 인물 단위 고정은 임베딩 저장소가 필요한 Phase 2 과제(FaceID의 정체성 견인으로 부분 보완).
 
+### 자체 LoRA v1 학습 완료 (2026-08-13 밤)
+- **구성**: SD1.5 · rank 16 · 2000스텝(200장×40에폭) · fp16+grad ckpt · 로컬 RTX 4060에서 52분 · $0.
+  트리거 `cutemon`, **색 보존 캡션**(`tools/build_captions.py` — 이미지별 주요 색 2개 삽입).
+- **vs 공개 LoRA(pcuenq)**: 닮음·색 보존(갈색 머리 유지)은 v1 압승, 크리처화는 기본 가중치에서 부족
+  → probe3로 해소: **L1.3 × FaceID 0.35 × CN 0.4**에서 헤어스타일이 귀·색 패치로 은유되는 크리처 확보.
+- **앱 적용 완료**: `models/style_lora/`(gitignore, 재현은 `training/lora_v1` 또는 재학습),
+  프롬프트 트리거 cutemon 교체("pokemon" 어휘 제거 — §10 정합), 기본값 C0.4/L1.3/F0.35.
+- 학습 스크립트: diffusers v0.39.0 `train_text_to_image_lora.py`(`training/`, gitignore).
+
 ### 다음 작업
-1. **자체 스타일 LoRA 학습** — `dataset/cute` 200장, **고유 트리거 토큰**으로 학습(IP 어휘 배제, §10).
-   현재 공개 LoRA(pcuenq)는 rank-4 임시 선검증용 — 파스텔 편향으로 검은 머리가 금발로 나오는 문제도
-   자체 학습에서 색 보존 캡션으로 개선 여지.
-2. **닮음 보강** — FaceID 0.45에서 닮음이 아직 약함. 스윕 축: FaceID 0.5~0.7 × CN 0.5 고정.
-3. **A/B 비교표** (§11 Phase 2 증빙) + 지인 5명 테스트(§11 Phase 1).
+1. **실기기 e2e + 지인 5명 테스트** (§11 Phase 1 기준: a+b 3/5).
+2. **A/B 비교표** (§11 Phase 2 증빙) — 구 모놀리식 vs 모듈형 경로.
+3. (품질 미달 시) v2 학습: 3000스텝+ / rank 32 / 캡션 어휘 확장.
 
 ### 함정 기록 (재발 방지)
 - 2023년식 LoRA(attn-proc 포맷)는 `load_lora_weights`가 **에러 없이 조용히 무시**한다
@@ -193,9 +200,9 @@
 | 역할 | 모델 |
 |---|---|
 | 생성 베이스 | `stable-diffusion-v1-5/stable-diffusion-v1-5` |
-| 스타일 | `pcuenq/pokemon-lora` @ 1.0 (임시 — 자체 학습으로 교체 예정) |
-| 정체성 | `h94/IP-Adapter-FaceID` @ 0.45 + insightface `buffalo_l` 임베딩 |
-| 형태 제어 | `lllyasviel/control_v11p_sd15_lineart` @ 0.5 |
+| 스타일 | **자체 v1 LoRA** `streamlit_app/models/style_lora` @ 1.3 (트리거 cutemon, 폴백 pcuenq) |
+| 정체성 | `h94/IP-Adapter-FaceID` @ 0.35 + insightface `buffalo_l` 임베딩 |
+| 형태 제어 | `lllyasviel/control_v11p_sd15_lineart` @ 0.4 |
 | 윤곽선 | `lllyasviel/Annotators` LineartDetector |
 | 얼굴 검출 | YuNet `models/yunet.onnx` (박스) — insightface(임베딩)와 용도 분리 |
 | 배경 제거 | rembg `u2net` + 턱 아래 컷(0.80) |
