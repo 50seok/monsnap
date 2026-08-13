@@ -30,12 +30,21 @@ SIZE = 512  # SD1.5 네이티브 해상도
 # "정체성 손실"로 배제했지만, 목표가 정체성→원형으로 바뀐 지금은 그 일반화가 곧 원하는 효과다.
 # 트리거 "cutemon" = 자체 LoRA 학습 캡션의 첫 토큰(빼면 카툰화된 사람이 나옴 — probe2·3 실측).
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
-def build_prompt(feature: str | None, hair: str) -> str:
-    color = {"black": "dark gray", "gray": "silver"}.get(hair, hair)  # 순흑은 악타입 회피
+def build_prompt(feature: str | None, palette: str) -> str:
     feat = f"{feature}, " if feature else ""
-    return (f"cutemon, a cute round {color} and cream creature, {feat}"
+    return (f"cutemon, a cute round {palette} creature, {feat}"
             "big sparkling eyes, smiling face, chubby simple body, bright cheerful colors")
 
+
+# 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
+# (한글명, 뱃지 RGB, 프롬프트 팔레트)
+TYPES = [
+    ("불", (239, 118, 61), "fiery orange and red"),
+    ("물", (88, 154, 240), "blue and aqua"),
+    ("풀", (120, 200, 80), "fresh green"),
+    ("전기", (247, 200, 46), "bright yellow"),
+    ("페어리", (238, 153, 200), "pastel pink and white"),
+]
 
 # CLIP 제로샷 특징 후보: (프롬프트 구절, 한국어 표시, 긍정 문장, 부정 문장)
 FEATURES = [
@@ -44,7 +53,6 @@ FEATURES = [
     ("with long flowing hair", "긴 머리", "a person with long hair", "a person with short hair"),
     ("with spiky hair", "뻗친 머리", "a person with spiky messy hair", "a person with neat flat hair"),
 ]
-HAIR_COLORS = ["black", "brown", "blonde", "gray", "red"]
 
 # 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
 NEG_PROMPT = (
@@ -183,8 +191,8 @@ def clip_model():
             CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32"))
 
 
-def pick_traits(crop: Image.Image) -> tuple[str | None, str | None, str]:
-    """CLIP 제로샷으로 대표 특징 1개(최대 마진, 미달 시 None)와 머리색을 고른다."""
+def pick_traits(crop: Image.Image) -> tuple[str | None, str | None]:
+    """CLIP 제로샷으로 대표 특징 1개를 고른다(최대 마진, 미달 시 None = 순수 원형)."""
     import torch
 
     model, proc = clip_model()
@@ -195,10 +203,7 @@ def pick_traits(crop: Image.Image) -> tuple[str | None, str | None, str]:
             p = model(**inp).logits_per_image.softmax(-1)[0]
             if p[0] - p[1] > margin:
                 best, best_ko, margin = phrase, ko, p[0] - p[1]
-        inp = proc(text=[f"a person with {c} hair" for c in HAIR_COLORS],
-                   images=crop, return_tensors="pt", padding=True)
-        hair = HAIR_COLORS[model(**inp).logits_per_image.softmax(-1)[0].argmax().item()]
-    return best, best_ko, hair
+    return best, best_ko
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -291,19 +296,27 @@ def identity(photo_bytes: bytes, photo: Image.Image):
 
 def generate(photo_bytes: bytes, control_scale: float, steps: int,
              lora_weight: float, faceid_scale: float, name: str):
-    """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부, 특징표시) 반환."""
+    """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부, 카드정보 dict) 반환."""
     import torch
 
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
     control = mask_background(photo, edge_detector()(photo))
     emb, seed_src = identity(photo_bytes, photo)
-    feature, feature_ko, hair = pick_traits(photo)
-    traits_ko = " · ".join(x for x in (feature_ko, f"{hair} 계열 색") if x)
+    feature, feature_ko = pick_traits(photo)
 
-    # 계층 시드(PRD §12-8): 얼굴 임베딩(주) + 이름(보조) → 같은 사진·같은 이름 = 같은 몬스터.
+    # 계층 시드(PRD §12-8 완성형): 얼굴 임베딩(주) → 시드(종족·실루엣),
+    # 이름(보조) → 속성(색·장식)만. 이름을 바꿔도 실루엣은 유지되고 색만 바뀐다.
     # ponytail: 사진이 다르면 임베딩도 달라 시드가 바뀐다 — 인물 단위 고정은 임베딩
     # 저장소가 필요한 Phase 2 과제. 사진 단위 재현성 + FaceID의 정체성 견인으로 갈음.
-    seed = int.from_bytes(hashlib.sha256(seed_src + name.encode()).digest()[:4], "big")
+    seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:4], "big")
+    type_src = name.strip().encode() if name.strip() else seed_src
+    type_ko, type_rgb, palette = TYPES[
+        int.from_bytes(hashlib.sha256(type_src).digest()[:4], "big") % len(TYPES)]
+    info = {
+        "traits": feature_ko or "없음 (순수 원형)",
+        "type_ko": type_ko, "type_rgb": type_rgb,
+        "dex": seed % 1000, "name": name.strip(),
+    }
 
     pipe = pipeline()
     if STYLE_LORA:
@@ -317,7 +330,7 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int,
         pipe.set_ip_adapter_scale(faceid_scale)
 
     result = pipe(
-        prompt=build_prompt(feature, hair),
+        prompt=build_prompt(feature, palette),
         negative_prompt=NEG_PROMPT,
         image=control,
         controlnet_conditioning_scale=control_scale,
@@ -328,7 +341,33 @@ def generate(photo_bytes: bytes, control_scale: float, steps: int,
         guidance_scale=9.0,
         generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
-    return to_png(result), to_png(control), to_png(photo), face_found, traits_ko
+    return to_png(result), to_png(control), to_png(photo), face_found, info
+
+
+def make_card(result_png: bytes, info: dict) -> bytes:
+    """결과를 도감 카드로 합성 — 속성색 테두리·뱃지, 이름, 도감 번호."""
+    from PIL import ImageDraw, ImageFont
+
+    W, H, M = 640, 840, 24
+    r, g, b = info["type_rgb"]
+    card = Image.new("RGB", (W, H), (r // 6 + 213, g // 6 + 213, b // 6 + 213))
+    d = ImageDraw.Draw(card)
+    d.rounded_rectangle([8, 8, W - 8, H - 8], radius=24, outline=info["type_rgb"], width=6)
+    art = Image.open(io.BytesIO(result_png)).resize((W - 2 * M, W - 2 * M))
+    card.paste(art, (M, 116))
+    try:  # 한국어 렌더링 — 맑은고딕(한국어 Windows 표준). 없으면 PIL 기본 폰트.
+        f_big = ImageFont.truetype(r"C:\Windows\Fonts\malgunbd.ttf", 44)
+        f_small = ImageFont.truetype(r"C:\Windows\Fonts\malgun.ttf", 24)
+    except OSError:
+        f_big = f_small = ImageFont.load_default()
+    d.text((M, 40), info["name"] or "이름 없는 몬스터", font=f_big, fill=(40, 40, 40))
+    badge = f"{info['type_ko']} 타입"
+    bw = d.textlength(badge, font=f_small)
+    d.rounded_rectangle([W - M - bw - 28, 46, W - M, 92], radius=22, fill=info["type_rgb"])
+    d.text((W - M - bw - 14, 55), badge, font=f_small, fill="white")
+    d.text((M, 116 + (W - 2 * M) + 16), f"특징: {info['traits']}", font=f_small, fill=(90, 90, 90))
+    d.text((M, H - 56), f"MonSnap 도감 No.{info['dex']:03d}", font=f_small, fill=(120, 120, 120))
+    return to_png(card)
 
 
 st.title("MonSnap 🐲")
@@ -390,10 +429,10 @@ if uploaded is not None:
         col1, col2 = st.columns(2)
         col1.image(photo_bytes, caption="원본", use_container_width=True)
 
-        # 계층 시드의 보조 키(PRD §12-8) — 같은 사진이라도 이름이 바뀌면 다른 몬스터
+        # 계층 시드의 보조 키(PRD §12-8) — 실루엣은 사진이, 속성(색)은 이름이 결정
         name = st.text_input(
             "몬스터 이름 (선택)", max_chars=20,
-            placeholder="이름을 지어 주세요 — 이름이 바뀌면 다른 몬스터가 태어납니다",
+            placeholder="이름을 지어 주세요 — 이름이 몬스터의 속성(색)을 결정합니다",
         )
 
         label = "다시 생성" if "result" in st.session_state else "몬스터 생성"
@@ -401,17 +440,19 @@ if uploaded is not None:
             t0 = time.monotonic()
             try:
                 with st.spinner("몬스터 소환 중…"):
-                    result, edge, crop, face_found, traits = generate(
+                    result, edge, crop, face_found, info = generate(
                         photo_bytes, control_scale, steps, lora_weight, faceid_scale, name
                     )
                 st.session_state["result"] = result
                 st.session_state["edge"] = edge
                 st.session_state["crop"] = crop
                 st.session_state["face_found"] = face_found
-                st.session_state["traits"] = traits
+                st.session_state["info"] = info
+                st.session_state["card"] = make_card(result, info)
                 log.info(
-                    "generate ok elapsed=%.1fs scale=%.2f lora=%.2f face=%.2f steps=%d",
+                    "generate ok elapsed=%.1fs scale=%.2f lora=%.2f face=%.2f steps=%d type=%s",
                     time.monotonic() - t0, control_scale, lora_weight, faceid_scale, steps,
+                    info["type_ko"],
                 )
             except Exception as exc:  # FR-4
                 st.session_state.pop("result", None)
@@ -423,8 +464,9 @@ if uploaded is not None:
 
         if "result" in st.session_state:
             col2.image(st.session_state["result"], caption="몬스터", use_container_width=True)
-            if st.session_state.get("traits"):
-                st.caption(f"반영된 특징: {st.session_state['traits']}")
+            if "info" in st.session_state:
+                i = st.session_state["info"]
+                st.caption(f"속성: {i['type_ko']} · 반영된 특징: {i['traits']} · 도감 No.{i['dex']:03d}")
 
             if not st.session_state.get("face_found", True):
                 st.warning(
@@ -438,15 +480,25 @@ if uploaded is not None:
                 e1, e2 = st.columns(2)
                 e1.image(st.session_state["crop"], caption="얼굴 크롭", use_container_width=True)
                 e2.image(st.session_state["edge"], caption="윤곽선", use_container_width=True)
-            st.download_button(
+            if "card" in st.session_state:
+                st.image(st.session_state["card"], caption="도감 카드", width=360)
+            b1, b2 = st.columns(2)
+            b1.download_button(
                 "이미지 저장",
                 data=st.session_state["result"],
                 file_name="monster.png",
                 mime="image/png",
             )
+            if "card" in st.session_state:
+                b2.download_button(
+                    "도감 카드 저장",
+                    data=st.session_state["card"],
+                    file_name="monsnap_card.png",
+                    mime="image/png",
+                )
             st.caption(
-                "같은 사진·같은 이름이면 항상 같은 몬스터가 나옵니다. "
-                "다른 몬스터를 원하면 이름을 바꿔 보세요."
+                "같은 사진이면 항상 같은 몬스터가 나옵니다. "
+                "이름을 바꾸면 속성(색)이 바뀝니다."
             )
 
 st.divider()
