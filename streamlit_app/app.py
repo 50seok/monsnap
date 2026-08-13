@@ -1,3 +1,4 @@
+import hashlib
 import io
 import logging
 import time
@@ -6,9 +7,13 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
 
-# 로컬 생성 스택: SD1.5 파생 모델 + ControlNet lineart(형태·특징 유지)
-# ponytail: 베이스 모델은 secrets로 교체 가능 — LoRA 자체 학습 후 여기만 바꾸면 됨
-BASE_MODEL = st.secrets.get("BASE_MODEL", "lambdalabs/sd-pokemon-diffusers")
+# 모듈형 스택: 표준 SD1.5 + 스타일 LoRA + IP-Adapter FaceID + ControlNet lineart.
+# 풀 파인튜닝 베이스(sd-pokemon-diffusers)는 FaceID를 막는다는 게 실측 확인돼
+# (PRD §13) 베이스는 순정으로 두고 스타일은 LoRA로 얹는다.
+# ponytail: 둘 다 secrets로 교체 가능 — 자체 학습 LoRA 완성 시 STYLE_LORA만 교체,
+# 구 모놀리식 경로로 롤백하려면 BASE_MODEL=lambdalabs/sd-pokemon-diffusers + STYLE_LORA="".
+BASE_MODEL = st.secrets.get("BASE_MODEL", "stable-diffusion-v1-5/stable-diffusion-v1-5")
+STYLE_LORA = st.secrets.get("STYLE_LORA", "pcuenq/pokemon-lora")
 # lineart > softedge (실측). softedge(HED)는 선이 뭉툭해서 눈매·입술·헤어라인이
 # 소실되고 강도를 올리면 뭉개져 붕괴한다. lineart는 쌍꺼풀·코 윤곽까지 선으로 남고
 # 강도를 올려도 붕괴 대신 "사람에 가까워지는" 방향이라 제어 구간이 넓다(0.5~0.8).
@@ -17,11 +22,13 @@ SIZE = 512  # SD1.5 네이티브 해상도
 
 # "monster"는 절대 넣지 말 것. 학습 데이터(pokemon-blip-captions)는 BLIP 자동 캡션이라
 # 무서운 포켓몬들이 "a monster"/"a demon"으로 캡션됐다. 그래서 이 단어 하나로 악타입
-# 클러스터가 소환되고, "cute"를 붙여도 못 이긴다(실측 확인). 귀여움은 형용사가 아니라
-# 명사 선택의 문제 — round/chubby/mascot 계열 어휘로 부를 것.
+# 클러스터가 소환되고, "cute"를 붙여도 못 이긴다(실측 확인).
+# 반대로 "a drawing of a ... pokemon"은 학습 캡션의 지배 패턴 = LoRA 트리거.
+# 이 어휘가 없으면 같은 가중치에서도 "카툰화된 사람"이 나온다(probe2 실측 — 셀 A vs B).
+# 자체 LoRA 학습 시엔 고유 트리거 토큰으로 교체할 것(IP 어휘 배제, PRD §10).
 PROMPT = (
-    "a cute round creature, big sparkling eyes, smiling face, "
-    "chubby simple body, bright cheerful colors, mascot character"
+    "a drawing of a cute round pokemon, big sparkling eyes, smiling face, "
+    "chubby simple body, bright cheerful colors"
 )
 # 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
 NEG_PROMPT = (
@@ -56,10 +63,52 @@ def pipeline():
         requires_safety_checker=False,
     )
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.load_ip_adapter(
+        "h94/IP-Adapter-FaceID", subfolder=None,
+        weight_name="ip-adapter-faceid_sd15.bin", image_encoder_folder=None,
+    )
+    if STYLE_LORA:
+        pipe.load_lora_weights(_style_lora_state(STYLE_LORA), adapter_name="style")
     # ponytail: VRAM 8GB — 전체 상주 대신 레이어 단위 오프로드. 더 빠르게 하려면
     # VRAM 12GB 이상에서 pipe.to("cuda")로 교체.
     pipe.enable_model_cpu_offload()
     return pipe
+
+
+def _style_lora_state(repo: str):
+    """임시 공개 LoRA(2023 attn-proc 포맷)를 PEFT 키로 변환해 state dict로 반환.
+
+    모던 포맷(자체 학습본)은 변환 없이 그대로 통과시킨다. 구식 포맷을 그냥
+    load_lora_weights에 넘기면 에러 없이 '키 0개 매칭' 경고만 내고 무시된다(실측) —
+    스타일이 조용히 빠진 채 사람 그림이 나오므로 여기서 미리 변환한다.
+    """
+    import torch
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(repo, "pytorch_lora_weights.bin")
+    except Exception:  # .bin이 없으면 모던 포맷 레포 — 그대로 로드
+        return repo
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    if not any(".processor." in k for k in sd):
+        return repo
+    return {
+        "unet." + k.replace(".processor.", ".").replace("to_out_lora", "to_out.0")
+        .replace("to_q_lora", "to_q").replace("to_k_lora", "to_k")
+        .replace("to_v_lora", "to_v")
+        .replace(".down.weight", ".lora_A.weight").replace(".up.weight", ".lora_B.weight"): v
+        for k, v in sd.items()
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def face_embedder():
+    """insightface — FaceID용 정체성 임베딩. YuNet(박스)과 용도가 다르다."""
+    from insightface.app import FaceAnalysis
+
+    fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    fa.prepare(ctx_id=0, det_size=(640, 640))
+    return fa
 
 
 @st.cache_resource(show_spinner=False)
@@ -170,17 +219,64 @@ def to_png(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def generate(photo_bytes: bytes, control_scale: float, steps: int):
+def identity(photo_bytes: bytes, photo: Image.Image):
+    """FaceID 임베딩 (2,1,512)와 시드 소스 바이트를 반환. 얼굴 못 찾으면 (None, 사진바이트).
+
+    임베딩은 원본에서 뽑는다 — 1.8배 타이트 크롭은 insightface 검출이 불안정하고,
+    ControlNet용 크롭(형태)과 FaceID용 임베딩(정체성)은 애초에 용도가 다르다.
+    """
+    import cv2
+    import numpy as np
+    import torch
+
+    src = ImageOps.exif_transpose(Image.open(io.BytesIO(photo_bytes))).convert("RGB")
+    faces = face_embedder().get(cv2.cvtColor(np.array(src), cv2.COLOR_RGB2BGR))
+    if not faces:
+        faces = face_embedder().get(cv2.cvtColor(np.array(photo), cv2.COLOR_RGB2BGR))
+    if not faces:
+        return None, photo_bytes
+
+    normed = max(faces, key=lambda f: f.det_score).normed_embedding
+    pos = torch.from_numpy(normed).unsqueeze(0)  # (1, 512)
+    # CFG용 네거티브(0벡터)를 dim 0에 쌓아 (2, 1, 512) — 빼면 chunk(2) 언패킹 실패
+    emb = torch.cat([torch.zeros_like(pos), pos], dim=0).unsqueeze(1)
+    return emb.to(dtype=torch.float16, device="cuda"), normed.tobytes()
+
+
+def generate(photo_bytes: bytes, control_scale: float, steps: int,
+             lora_weight: float, faceid_scale: float, name: str):
     """(결과 PNG, 윤곽선 PNG, 전처리 입력 PNG, 얼굴검출여부) 반환."""
+    import torch
+
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
     control = mask_background(photo, edge_detector()(photo))
-    result = pipeline()(
+    emb, seed_src = identity(photo_bytes, photo)
+
+    # 계층 시드(PRD §12-8): 얼굴 임베딩(주) + 이름(보조) → 같은 사진·같은 이름 = 같은 몬스터.
+    # ponytail: 사진이 다르면 임베딩도 달라 시드가 바뀐다 — 인물 단위 고정은 임베딩
+    # 저장소가 필요한 Phase 2 과제. 사진 단위 재현성 + FaceID의 정체성 견인으로 갈음.
+    seed = int.from_bytes(hashlib.sha256(seed_src + name.encode()).digest()[:4], "big")
+
+    pipe = pipeline()
+    if STYLE_LORA:
+        # faceid_0(FaceID 체크포인트에 내장된 LoRA)도 같이 켜야 한다 —
+        # style만 넘기면 set_adapters가 faceid_0을 비활성화해 닮음이 사라진다(실측)
+        pipe.set_adapters(["faceid_0", "style"], adapter_weights=[1.0, lora_weight])
+    if emb is None:  # 얼굴 없음 — FaceID 끄고 0벡터로 채워 파이프라인 요구만 충족
+        pipe.set_ip_adapter_scale(0.0)
+        emb = torch.zeros((2, 1, 512), dtype=torch.float16, device="cuda")
+    else:
+        pipe.set_ip_adapter_scale(faceid_scale)
+
+    result = pipe(
         prompt=PROMPT,
         negative_prompt=NEG_PROMPT,
         image=control,
         controlnet_conditioning_scale=control_scale,
+        ip_adapter_image_embeds=[emb],
         num_inference_steps=steps,
         guidance_scale=7.5,
+        generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
     return to_png(result), to_png(control), to_png(photo), face_found
 
@@ -192,8 +288,18 @@ with st.sidebar:
     st.subheader("생성 설정")
     # PRD §12-4(마스코트형 ↔ 크리처형)는 결국 이 숫자 하나다
     control_scale = st.slider(
-        "형태 반영 강도", 0.0, 1.2, 0.65, 0.05,
-        help="0.5=귀엽지만 덜 닮음 · 0.65=권장(균형) · 0.8=닮지만 사람에 가까움",
+        "형태 반영 강도", 0.0, 1.2, 0.5, 0.05,
+        help="0.35=크리처에 가까움 · 0.5=권장(균형) · 0.65=닮지만 사람 구조가 남음",
+    )
+    # PRD §13 작업 2의 답(probe2 실측): 크리처화는 LoRA 가중치보다 트리거 어휘와
+    # ControlNet 완화가 결정한다. LoRA는 1.0이면 충분(1.2와 차이 없음).
+    lora_weight = st.slider(
+        "스타일 강도", 0.0, 1.2, 1.0, 0.05,
+        help="크리처 그림체로 미는 힘 — 약하면 사람 그림이 됩니다",
+    )
+    faceid_scale = st.slider(
+        "닮음 강도", 0.0, 1.0, 0.45, 0.05,
+        help="원본 얼굴을 반영하는 힘 — 세면 사람에 가까워집니다",
     )
     steps = st.slider("스텝 수", 10, 40, 25, 5, help="높을수록 느리고 정교함")
     show_edge = st.checkbox("윤곽선 같이 보기", value=True)
@@ -235,19 +341,27 @@ if uploaded is not None:
         col1, col2 = st.columns(2)
         col1.image(photo_bytes, caption="원본", use_container_width=True)
 
+        # 계층 시드의 보조 키(PRD §12-8) — 같은 사진이라도 이름이 바뀌면 다른 몬스터
+        name = st.text_input(
+            "몬스터 이름 (선택)", max_chars=20,
+            placeholder="이름을 지어 주세요 — 이름이 바뀌면 다른 몬스터가 태어납니다",
+        )
+
         label = "다시 생성" if "result" in st.session_state else "몬스터 생성"
         if st.button(label, type="primary"):
             t0 = time.monotonic()
             try:
                 with st.spinner("몬스터 소환 중…"):
-                    result, edge, crop, face_found = generate(photo_bytes, control_scale, steps)
+                    result, edge, crop, face_found = generate(
+                        photo_bytes, control_scale, steps, lora_weight, faceid_scale, name
+                    )
                 st.session_state["result"] = result
                 st.session_state["edge"] = edge
                 st.session_state["crop"] = crop
                 st.session_state["face_found"] = face_found
                 log.info(
-                    "generate ok elapsed=%.1fs scale=%.2f steps=%d",
-                    time.monotonic() - t0, control_scale, steps,
+                    "generate ok elapsed=%.1fs scale=%.2f lora=%.2f face=%.2f steps=%d",
+                    time.monotonic() - t0, control_scale, lora_weight, faceid_scale, steps,
                 )
             except Exception as exc:  # FR-4
                 st.session_state.pop("result", None)
@@ -278,7 +392,10 @@ if uploaded is not None:
                 file_name="monster.png",
                 mime="image/png",
             )
-            st.caption("마음에 안 드시면 '다시 생성'을 눌러 보세요 — 매번 다른 결과가 나옵니다.")
+            st.caption(
+                "같은 사진·같은 이름이면 항상 같은 몬스터가 나옵니다. "
+                "다른 몬스터를 원하면 이름을 바꿔 보세요."
+            )
 
 st.divider()
 st.caption("사진은 이 PC 안에서만 처리됩니다. 외부로 전송되지 않습니다.")

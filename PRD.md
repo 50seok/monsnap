@@ -161,12 +161,49 @@
 | 7 | Phase 3 브랜딩(오리지널 몬스터 세계관) | Phase 2 완료 후 |
 | 8 | **시드 정책** — 유력안 = **계층 시드**: 얼굴 임베딩(주 키)이 종족·실루엣 결정, 이름 해시(보조)는 색·장식만 결정 + 속성 선택(불/물/풀) 옵션. Phase 1은 이름 제약 없음(이름 바꿔 다중 생성 = 놀이로 수용, 비용은 횟수 제한으로 방어), 계층 시드는 Phase 2~실서비스에서 적용 | Phase 1 샘플 생성 후 |
 
-## 13. 구현 상태 (2026-08-13) — 중단 시점 인계
+## 13. 구현 상태 (2026-08-13 저녁) — 모듈형 전환 완료
 
-### 다음 세션 재개 키워드
-`모듈형 전환` `표준 SD1.5` `스타일 LoRA` `가중치 균형` `계층 시드`
+### 완료 — 인계 작업 1·2·3 전부
+- **모듈형 스택 전환**: `app.py` = 표준 SD1.5 + 스타일 LoRA + IP-Adapter FaceID + lineart ControlNet.
+  베이스·LoRA 모두 secrets 교체 지점(`BASE_MODEL`, `STYLE_LORA`) — 자체 학습 LoRA 완성 시 STYLE_LORA만 교체, 구 모놀리식 롤백은 `BASE_MODEL=lambdalabs/sd-pokemon-diffusers` + `STYLE_LORA=""`.
+- **가중치 균형 (probe2 실측 답)**: 크리처화의 결정 변수는 LoRA 가중치가 아니라
+  ① **트리거 어휘** — 프롬프트에 학습 캡션 지배 패턴("a drawing of a ... pokemon")이 없으면
+  같은 가중치에서도 카툰화된 사람이 나옴. ② **ControlNet 완화** — 0.65는 사람 구조 잔존,
+  **0.5 = 균형점**, 0.35는 크리처지만 닮음 소실. LoRA는 1.0이면 충분(1.2와 차이 없음).
+  기본값: CN 0.5 · LoRA 1.0 · FaceID 0.45.
+- **계층 시드**: 얼굴 임베딩 SHA-256(주) + 이름(보조) → 같은 사진·같은 이름 = 같은 몬스터.
+  결정론·이름 변형 모두 스모크 테스트로 검증(같은 입력 = 동일 PNG 바이트).
+  한계: 같은 인물의 **다른 사진**은 임베딩이 달라 시드가 다름 — 인물 단위 고정은 임베딩 저장소가 필요한 Phase 2 과제(FaceID의 정체성 견인으로 부분 보완).
 
-### 직전 검증 결과 (가장 중요)
+### 다음 작업
+1. **자체 스타일 LoRA 학습** — `dataset/cute` 200장, **고유 트리거 토큰**으로 학습(IP 어휘 배제, §10).
+   현재 공개 LoRA(pcuenq)는 rank-4 임시 선검증용 — 파스텔 편향으로 검은 머리가 금발로 나오는 문제도
+   자체 학습에서 색 보존 캡션으로 개선 여지.
+2. **닮음 보강** — FaceID 0.45에서 닮음이 아직 약함. 스윕 축: FaceID 0.5~0.7 × CN 0.5 고정.
+3. **A/B 비교표** (§11 Phase 2 증빙) + 지인 5명 테스트(§11 Phase 1).
+
+### 함정 기록 (재발 방지)
+- 2023년식 LoRA(attn-proc 포맷)는 `load_lora_weights`가 **에러 없이 조용히 무시**한다
+  → `app.py::_style_lora_state()`가 PEFT 키로 변환. 자체 학습본(모던 포맷)은 그대로 통과.
+- FaceID 체크포인트는 `faceid_0`이라는 내장 LoRA를 등록한다 —
+  `set_adapters(["style"])`만 호출하면 FaceID가 꺼짐. 반드시 둘 다 활성화.
+- 이 노트북(RAM 16GB)에서 SD 파이프라인 프로세스 **동시 2개 금지** — 스왑으로 로딩이 수십 분대로 늘어짐.
+
+### 현재 스택
+| 역할 | 모델 |
+|---|---|
+| 생성 베이스 | `stable-diffusion-v1-5/stable-diffusion-v1-5` |
+| 스타일 | `pcuenq/pokemon-lora` @ 1.0 (임시 — 자체 학습으로 교체 예정) |
+| 정체성 | `h94/IP-Adapter-FaceID` @ 0.45 + insightface `buffalo_l` 임베딩 |
+| 형태 제어 | `lllyasviel/control_v11p_sd15_lineart` @ 0.5 |
+| 윤곽선 | `lllyasviel/Annotators` LineartDetector |
+| 얼굴 검출 | YuNet `models/yunet.onnx` (박스) — insightface(임베딩)와 용도 분리 |
+| 배경 제거 | rembg `u2net` + 턱 아래 컷(0.80) |
+| 시드 | 얼굴 임베딩 SHA-256 + 이름 해시 |
+
+### 이전 상태 (2026-08-13 오전) — 중단 시점 인계
+
+#### 직전 검증 결과
 **표준 SD1.5 + lineart ControlNet + IP-Adapter FaceID** (스타일 LoRA 없이) 실측:
 - ✅ **FaceID가 표준 베이스에서 강력히 작동.** 원본 인물과 명확히 닮은 얼굴, 안경까지 정확 반영.
   기존 `sd-pokemon-diffusers` 베이스에서 효과가 미미했던 원인이 "풀 파인튜닝된 베이스가

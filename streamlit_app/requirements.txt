@@ -12,3 +12,4 @@ safetensors
 peft
 controlnet_aux
 rembg
+insightface
