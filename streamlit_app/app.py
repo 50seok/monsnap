@@ -229,13 +229,28 @@ def ref_index():
     return paths, torch.cat(embs), shapes
 
 
-def match_reference(crop: Image.Image) -> tuple[Image.Image, float, str]:
-    """사람 얼굴과 CLIP 유사도 top-1 원형. (512px 이미지, 유사도, 체형) 반환."""
+# 사지 구조가 있는 체형만 밑그림 후보로 — 사랑둥이류(heads/fish/ball/blob…)가 밑그림이
+# 되면 변신 후 '이도저도 아닌 덩어리'가 된다(probe14 진단). 구조가 있는 원형에서
+# 출발해야 팔·다리·꼬리가 읽히는 몸이 나온다.
+STRUCTURED_SHAPES = {"upright", "quadruped", "humanoid", "legs", "arms", "wings"}
+REF_TOP_K = 5  # top-1 고정이 아니라 상위 K 중 시드로 결정론 선택 — 원형 다양성 확보
+
+
+def match_reference(crop: Image.Image, pick: int = 0) -> tuple[Image.Image, float, str]:
+    """구조형 원형 중 CLIP 상위 K에서 pick번째. (512px 이미지, 유사도, 체형) 반환."""
+    import torch
+
     paths, embs, shapes = ref_index()
-    sim = (embs @ _clip_image_features([crop]).T).squeeze(1)
-    idx = int(sim.argmax())
+    ok = [i for i, p in enumerate(paths)
+          if shapes.get(p.name, {}).get("shape") in STRUCTURED_SHAPES]
+    if not ok:  # manifest 없음 — 전체에서 top-1 (구버전 동작)
+        ok = list(range(len(paths)))
+    sim = (embs[ok] @ _clip_image_features([crop]).T).squeeze(1)
+    top = torch.topk(sim, min(REF_TOP_K, len(ok))).indices.tolist()
+    idx = ok[top[pick % len(top)]]
     shape = shapes.get(paths[idx].name, {}).get("shape", "")
-    return Image.open(paths[idx]).convert("RGB").resize((SIZE, SIZE)), float(sim[idx]), shape
+    chosen_sim = float((embs[idx] @ _clip_image_features([crop]).T).squeeze())
+    return Image.open(paths[idx]).convert("RGB").resize((SIZE, SIZE)), chosen_sim, shape
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -338,11 +353,11 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
     emb, seed_src = identity(photo_bytes, photo)
     feature, feature_ko, scores = pick_traits(photo)
-    ref, ref_sim, ref_shape = match_reference(photo)
 
     # 계층 시드(PRD §12-8 완성형): 얼굴 임베딩(주) → 시드·레퍼런스(종족),
     # 이름(보조) → 속성(색·장식)만. 이름을 바꿔도 종족은 유지되고 색만 바뀐다.
     seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:4], "big")
+    ref, ref_sim, ref_shape = match_reference(photo, pick=seed)
     type_src = name.strip().encode() if name.strip() else seed_src
     type_ko, type_rgb, palette = TYPES[
         int.from_bytes(hashlib.sha256(type_src).digest()[:4], "big") % len(TYPES)]
