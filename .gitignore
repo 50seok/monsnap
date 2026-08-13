@@ -9,3 +9,4 @@ dist/
 dataset/
 lora_out/
 *.safetensors
+training/
