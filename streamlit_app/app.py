@@ -36,8 +36,23 @@ REF_DIR = Path(__file__).parent.parent / "dataset" / "cute"
 # 강해서, 뒤에 두면 img2img가 레퍼런스에 없는 사물(안경 등)을 안 그린다(probe7b·c 실측).
 # 트리거 "cutemon" = 자체 LoRA 학습 캡션의 첫 토큰(빼면 카툰화된 사람 — probe2·3 실측).
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
-def build_prompt(feature: str | None, palette: str) -> str:
+# PokéAPI 공식 체형(shape) → 부위 어휘. img2img는 레퍼런스의 형태 덩어리만 물려받고
+# 그 덩어리가 무엇인지는 모른다 — 정답 데이터로 "이 덩어리는 꼬리"라고 알려준다(probe13).
+# ⚠ 종을 암시하는 명사(fish 등)는 금지 — 얼굴까지 물고기가 된다(probe12 실측). 사지 어휘만.
+SHAPE_PHRASES = {
+    "ball": "a simple round body", "squiggle": "a curled body with a clear tail",
+    "fish": "one clear round tail", "arms": "two clearly separated arms",
+    "blob": "a soft round body", "upright": "clearly separated arms and legs",
+    "legs": "two clearly separated legs", "quadruped": "four clearly separated legs",
+    "wings": "two clearly separated wings", "tentacles": "clearly separated tentacles",
+    "heads": "a round head body", "humanoid": "two clear arms and two clear legs",
+    "bug-wings": "clearly separated wings", "armor": "a shell-covered body",
+}
+
+
+def build_prompt(feature: str | None, palette: str, shape: str = "") -> str:
     feat = f"{feature}, " if feature else ""
+    part = f"{SHAPE_PHRASES[shape]}, " if shape in SHAPE_PHRASES else ""
     # 얼굴 구절("cute simple face, round dot eyes, tiny smiling mouth")을 앞에 고정 —
     # v3에 섞인 무생물형 포켓몬의 '얼굴 없는 모드'를 차단(probe9, 네거티브 faceless와 세트).
     # 특징은 중간 위치로 강등 — 맨 앞에 두면 안경 하나가 디자인 전체를 지배한다(사용자 피드백).
@@ -46,7 +61,7 @@ def build_prompt(feature: str | None, palette: str) -> str:
     return ("cutemon creature, full body, standing, "
             f"a cute round {palette} creature with a cute simple face, "
             f"round dot eyes, a tiny clean simple smile, clean thin lineart, {feat}"
-            "chubby simple body, flat colors")
+            f"{part}distinct body parts, chubby simple body, flat colors")
 
 
 # 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
@@ -200,21 +215,27 @@ def _clip_image_features(imgs):
 
 @st.cache_resource(show_spinner="원형 도감 인덱싱 중… (최초 1회 ~20초)")
 def ref_index():
-    """레퍼런스 200장의 CLIP 임베딩 인덱스. (경로 리스트, 임베딩 텐서)"""
+    """레퍼런스 200장의 CLIP 임베딩 인덱스. (경로 리스트, 임베딩 텐서, 체형 dict)"""
+    import json
+
     import torch
 
     paths = sorted(REF_DIR.glob("*.png"))
     embs = [_clip_image_features([Image.open(p).convert("RGB") for p in paths[i:i + 64]])
             for i in range(0, len(paths), 64)]
-    return paths, torch.cat(embs)
+    manifest_path = REF_DIR / "manifest.json"  # tools/build_ref_manifest.py 산출물
+    shapes = (json.loads(manifest_path.read_text("utf-8"))
+              if manifest_path.exists() else {})
+    return paths, torch.cat(embs), shapes
 
 
-def match_reference(crop: Image.Image) -> tuple[Image.Image, float]:
-    """사람 얼굴과 CLIP 유사도 top-1 원형 한 마리. (512px 이미지, 유사도) 반환."""
-    paths, embs = ref_index()
+def match_reference(crop: Image.Image) -> tuple[Image.Image, float, str]:
+    """사람 얼굴과 CLIP 유사도 top-1 원형. (512px 이미지, 유사도, 체형) 반환."""
+    paths, embs, shapes = ref_index()
     sim = (embs @ _clip_image_features([crop]).T).squeeze(1)
     idx = int(sim.argmax())
-    return Image.open(paths[idx]).convert("RGB").resize((SIZE, SIZE)), float(sim[idx])
+    shape = shapes.get(paths[idx].name, {}).get("shape", "")
+    return Image.open(paths[idx]).convert("RGB").resize((SIZE, SIZE)), float(sim[idx]), shape
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
@@ -317,7 +338,7 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
     photo, face_found = prepare(Image.open(io.BytesIO(photo_bytes)))
     emb, seed_src = identity(photo_bytes, photo)
     feature, feature_ko, scores = pick_traits(photo)
-    ref, ref_sim = match_reference(photo)
+    ref, ref_sim, ref_shape = match_reference(photo)
 
     # 계층 시드(PRD §12-8 완성형): 얼굴 임베딩(주) → 시드·레퍼런스(종족),
     # 이름(보조) → 속성(색·장식)만. 이름을 바꿔도 종족은 유지되고 색만 바뀐다.
@@ -346,7 +367,7 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
         pipe.set_ip_adapter_scale(faceid_scale)
 
     result = pipe(
-        prompt=build_prompt(feature, palette),
+        prompt=build_prompt(feature, palette, ref_shape),
         negative_prompt=NEG_PROMPT,
         image=ref,
         strength=strength,
