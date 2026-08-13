@@ -31,9 +31,11 @@ REF_DIR = Path(__file__).parent.parent / "dataset" / "cute"
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
 def build_prompt(feature: str | None, palette: str) -> str:
     feat = f"{feature}, " if feature else ""
+    # "simple small dot eyes"+"flat colors": 사람 눈처럼 정교한 눈을 막고 포켓몬식
+    # 단순한 눈으로(사용자 피드백 + probe8). 네거티브의 realistic eyes와 세트.
     return (f"cutemon creature {feat}full body, standing, "
-            f"a cute round {palette} creature, big sparkling eyes, smiling face, "
-            "chubby simple body, bright cheerful colors")
+            f"a cute round {palette} creature, simple small dot eyes, smiling face, "
+            "chubby simple body, flat colors, bright cheerful colors")
 
 
 # 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
@@ -59,6 +61,9 @@ FEATURES = [
     ("with a wide smiling mouth", "큰 입", "a person with a wide big mouth", "a person with a small mouth"),
     ("with chubby cheeks", "통통한 볼", "a person with chubby round cheeks", "a person with a slim narrow face"),
     ("with thick bold eyebrows", "진한 눈썹", "a person with thick dark eyebrows", "a person with thin light eyebrows"),
+    ("with a small beauty mark", "점", "a person with a facial mole or beauty mark", "a person with clear smooth skin"),
+    ("with big round ears", "큰 귀", "a person with big prominent ears", "a person with small flat ears"),
+    ("with a wide broad forehead", "넓은 이마", "a person with a wide broad forehead", "a person with a forehead covered by bangs"),
 ]
 
 # 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
@@ -66,7 +71,8 @@ NEG_PROMPT = (
     "monster, demon, scary, evil, fangs, sharp teeth, claws, bat wings, "
     "dark, muscular, horror, "
     "human, person, human face, realistic face, photograph, text, watermark, "
-    "blurry, deformed, extra limbs, ugly"
+    "blurry, deformed, extra limbs, ugly, "
+    "realistic eyes, detailed iris, human eyes"
 )
 MAX_UPLOAD = 10 * 1024 * 1024
 
@@ -368,11 +374,11 @@ st.caption("사진을 찍으면 나만의 몬스터가 태어납니다")
 
 with st.sidebar:
     st.subheader("생성 설정")
-    # probe7b·c 실측: 0.7 = 원형의 몸 구조는 유지하면서 색·특징이 갈아입혀지는 지점.
-    # 0.5 이하면 원형 복제에 가까워지고(IP 리스크), 0.9면 원형 앵커가 사라진다.
+    # probe8 실측: 0.85 = 눈·색이 확실히 새 창작으로 바뀌면서 특징(안경)은 유지.
+    # 0.7 이하는 원형과 너무 닮고(사용자 피드백 + IP 리스크), 0.9부터 특징이 소실됨.
     strength = st.slider(
-        "변신 정도", 0.5, 0.9, 0.7, 0.05,
-        help="낮으면 매칭된 원형 그대로, 높으면 원형에서 멀어집니다",
+        "변신 정도", 0.5, 0.95, 0.85, 0.05,
+        help="낮으면 매칭된 원형 그대로, 높으면 완전히 새로운 창작",
     )
     lora_weight = st.slider(
         "스타일 강도", 0.0, 1.5, 1.45, 0.05,
