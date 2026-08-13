@@ -19,6 +19,13 @@ STYLE_LORA = st.secrets.get(
     str(_LOCAL_LORA) if (_LOCAL_LORA / "pytorch_lora_weights.safetensors").exists()
     else "pcuenq/pokemon-lora",
 )
+# 보조 스타일 = v2(큐레이션 200장 학습). v3(전체 1025장)는 포켓몬 비례를 주지만
+# 무생물형 포켓몬의 '얼굴 없는 모드'가 섞여서, 귀여움·얼굴 편향의 v2를 낮은 가중치로
+# 혼합해 상쇄한다(probe9: v3 1.1 + v2 0.7이 최적). 없으면 v3 단독.
+_LOCAL_LORA2 = Path(__file__).parent / "models" / "style_lora_v2"
+STYLE_LORA2 = (str(_LOCAL_LORA2)
+               if (_LOCAL_LORA2 / "pytorch_lora_weights.safetensors").exists() else "")
+STYLE2_WEIGHT = 0.7
 SIZE = 512  # SD1.5 네이티브 해상도
 # 레퍼런스 원형 후보 = 큐레이션된 귀여운 200장. 사람 얼굴과 CLIP 유사도 top-1 한 마리를
 # img2img 밑그림으로 써서 "여러 포켓몬 평균"이 만들던 키메라를 없앤다(probe7, 사용자 제안).
@@ -31,11 +38,13 @@ REF_DIR = Path(__file__).parent.parent / "dataset" / "cute"
 # "monster"는 절대 넣지 말 것(공개 데이터셋 캡션의 악타입 클러스터 소환 — 이전 실측).
 def build_prompt(feature: str | None, palette: str) -> str:
     feat = f"{feature}, " if feature else ""
-    # "simple small dot eyes"+"flat colors": 사람 눈처럼 정교한 눈을 막고 포켓몬식
-    # 단순한 눈으로(사용자 피드백 + probe8). 네거티브의 realistic eyes와 세트.
-    return (f"cutemon creature {feat}full body, standing, "
-            f"a cute round {palette} creature, simple small dot eyes, smiling face, "
-            "chubby simple body, flat colors, bright cheerful colors")
+    # 얼굴 구절("cute simple face, round dot eyes, tiny smiling mouth")을 앞에 고정 —
+    # v3에 섞인 무생물형 포켓몬의 '얼굴 없는 모드'를 차단(probe9, 네거티브 faceless와 세트).
+    # 특징은 중간 위치로 강등 — 맨 앞에 두면 안경 하나가 디자인 전체를 지배한다(사용자 피드백).
+    return ("cutemon creature, full body, standing, "
+            f"a cute round {palette} creature with a cute simple face, "
+            f"round dot eyes, tiny smiling mouth, {feat}"
+            "chubby simple body, flat colors")
 
 
 # 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
@@ -72,7 +81,8 @@ NEG_PROMPT = (
     "dark, muscular, horror, "
     "human, person, human face, realistic face, photograph, text, watermark, "
     "blurry, deformed, extra limbs, ugly, "
-    "realistic eyes, detailed iris, human eyes"
+    "realistic eyes, detailed iris, human eyes, "
+    "faceless, no face, mechanical, robot, pokeball, orb, machine"
 )
 MAX_UPLOAD = 10 * 1024 * 1024
 
@@ -100,6 +110,8 @@ def pipeline():
     )
     if STYLE_LORA:
         pipe.load_lora_weights(_style_lora_state(STYLE_LORA), adapter_name="style")
+    if STYLE_LORA2:
+        pipe.load_lora_weights(STYLE_LORA2, adapter_name="style2")
     # ponytail: VRAM 8GB — 전체 상주 대신 레이어 단위 오프로드. 더 빠르게 하려면
     # VRAM 12GB 이상에서 pipe.to("cuda")로 교체.
     pipe.enable_model_cpu_offload()
@@ -321,7 +333,9 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
     if STYLE_LORA:
         # faceid_0(FaceID 체크포인트에 내장된 LoRA)도 같이 켜야 한다 —
         # style만 넘기면 set_adapters가 faceid_0을 비활성화해 닮음이 사라진다(실측)
-        pipe.set_adapters(["faceid_0", "style"], adapter_weights=[1.0, lora_weight])
+        names = ["faceid_0", "style"] + (["style2"] if STYLE_LORA2 else [])
+        weights = [1.0, lora_weight] + ([STYLE2_WEIGHT] if STYLE_LORA2 else [])
+        pipe.set_adapters(names, adapter_weights=weights)
     if emb is None:  # 얼굴 없음 — FaceID 끄고 0벡터로 채워 파이프라인 요구만 충족
         pipe.set_ip_adapter_scale(0.0)
         emb = torch.zeros((2, 1, 512), dtype=torch.float16, device="cuda")
@@ -380,8 +394,9 @@ with st.sidebar:
         "변신 정도", 0.5, 0.95, 0.85, 0.05,
         help="낮으면 매칭된 원형 그대로, 높으면 완전히 새로운 창작",
     )
+    # probe9: v3 1.1 + v2 0.7 혼합이 최적 — 슬라이더는 주 스타일(v3)만 조절
     lora_weight = st.slider(
-        "스타일 강도", 0.0, 1.5, 1.45, 0.05,
+        "스타일 강도", 0.0, 1.5, 1.1, 0.05,
         help="크리처 그림체로 미는 힘 — 약하면 사람 그림이 됩니다",
     )
     faceid_scale = st.slider(
