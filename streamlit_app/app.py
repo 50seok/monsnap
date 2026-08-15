@@ -7,30 +7,28 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image, ImageOps
 
-# 모듈형 스택: 표준 SD1.5 + 스타일 LoRA + IP-Adapter FaceID + ControlNet lineart.
-# 풀 파인튜닝 베이스(sd-pokemon-diffusers)는 FaceID를 막는다는 게 실측 확인돼
-# (PRD §13) 베이스는 순정으로 두고 스타일은 LoRA로 얹는다.
-# 기본 LoRA = 자체 학습 v1(트리거 cutemon, 색 보존 캡션). 가중치는 커밋 금지(*.safetensors)라
-# 파일이 없는 환경에선 공개 LoRA로 폴백 — 그땐 PROMPT 트리거를 "pokemon"으로 맞출 것.
-BASE_MODEL = st.secrets.get("BASE_MODEL", "stable-diffusion-v1-5/stable-diffusion-v1-5")
-_LOCAL_LORA = Path(__file__).parent / "models" / "style_lora"
+# SDXL 스택: Animagine XL 4.0(danbooru 학습 애니 베이스) + 자체 cutemon SDXL LoRA
+# + IP-Adapter FaceID SDXL. SD1.5의 남은 격차(입 뭉개짐·팔다리 소실·특징 소실)가
+# 베이스 디테일 한계로 확인돼 전환(PRD §13, probe_sdxl 1·2: 입·팔다리·안경 전부 우세).
+# LoRA = dataset/full 1025장 × 5000스텝 중 checkpoint-4000(스윕 실측, v3 때와 동일 패턴).
+# SD1.5 롤백: BASE_MODEL=stable-diffusion-v1-5/… + STYLE_LORA=models/style_lora (secrets).
+BASE_MODEL = st.secrets.get("BASE_MODEL", "cagliostrolab/animagine-xl-4.0")
+_LOCAL_LORA = Path(__file__).parent / "models" / "style_lora_sdxl"
 STYLE_LORA = st.secrets.get(
     "STYLE_LORA",
-    str(_LOCAL_LORA) if (_LOCAL_LORA / "pytorch_lora_weights.safetensors").exists()
-    else "pcuenq/pokemon-lora",
+    str(_LOCAL_LORA) if (_LOCAL_LORA / "pytorch_lora_weights.safetensors").exists() else "",
 )
-# 보조 스타일 = v2(큐레이션 200장 학습). v3(전체 1025장)는 포켓몬 비례를 주지만
-# 무생물형 포켓몬의 '얼굴 없는 모드'가 섞여서, 귀여움·얼굴 편향의 v2를 낮은 가중치로
-# 혼합해 상쇄한다(probe9: v3 1.1 + v2 0.7이 최적). 없으면 v3 단독.
-_LOCAL_LORA2 = Path(__file__).parent / "models" / "style_lora_v2"
-STYLE_LORA2 = (str(_LOCAL_LORA2)
-               if (_LOCAL_LORA2 / "pytorch_lora_weights.safetensors").exists() else "")
-STYLE2_WEIGHT = 0.7
-SIZE = 512  # SD1.5 네이티브 해상도
-# 레퍼런스 원형 후보 = 큐레이션된 귀여운 200장. 사람 얼굴과 CLIP 유사도 top-1 한 마리를
-# img2img 밑그림으로 써서 "여러 포켓몬 평균"이 만들던 키메라를 없앤다(probe7, 사용자 제안).
-# ⚠ IP: 특정 원형에 앵커하므로 실서비스 전 클린 데이터로 교체 필수(PRD §10).
-REF_DIR = Path(__file__).parent.parent / "dataset" / "cute"
+SIZE = 512       # 얼굴 크롭·원형 인덱스 해상도(CLIP·데이터셋과 일치)
+GEN_SIZE = 1024  # SDXL 네이티브 생성 해상도
+# 레퍼런스 원형 = img2img 밑그림 풀. 사람 얼굴과 CLIP 유사도 상위에서 시드로 1마리 —
+# 단일 밑그림이라 "여러 후보 평균"이 만들던 키메라를 없앤다(probe7, 사용자 제안).
+# 레퍼런스 풀 = dataset/proto_dex(동물 사진 기반 큐레이션 원형, 30종) — 특정 포켓몬
+# 닮음·IP 문제를 모티브 원천(동물)에서 출발해 구조적으로 회피(probe_animal).
+# secrets REF_DIR로 다른 풀(예: dataset/cute 포켓몬 아트) 실험 가능하나, 그 경우
+# STRUCTURED_SHAPES를 {"upright","quadruped","humanoid","legs","arms","wings"}로
+# 좁혀야 함 — dataset/cute는 fish도 무사지 덩어리라 넓은 필터에서 블롭 재발(PRD §13).
+REF_DIR = Path(st.secrets.get(
+    "REF_DIR", str(Path(__file__).parent.parent / "dataset" / "proto_dex")))
 
 # 레퍼런스 합성 모드 프롬프트. 특징 구절을 맨 앞에 — CLIP 텍스트 인코더는 앞 토큰이
 # 강해서, 뒤에 두면 img2img가 레퍼런스에 없는 사물(안경 등)을 안 그린다(probe7b·c 실측).
@@ -50,28 +48,38 @@ SHAPE_PHRASES = {
 }
 
 
-def build_prompt(feature: str | None, palette: str, shape: str = "") -> str:
+def build_prompt(feature: str | None, palette: str, shape: str = "",
+                 signature: str = "") -> str:
     feat = f"{feature}, " if feature else ""
     part = f"{SHAPE_PHRASES[shape]}, " if shape in SHAPE_PHRASES else ""
-    # 얼굴 구절("cute simple face, round dot eyes, tiny smiling mouth")을 앞에 고정 —
-    # v3에 섞인 무생물형 포켓몬의 '얼굴 없는 모드'를 차단(probe9, 네거티브 faceless와 세트).
-    # 특징은 중간 위치로 강등 — 맨 앞에 두면 안경 하나가 디자인 전체를 지배한다(사용자 피드백).
-    # "a tiny clean simple smile, clean thin lineart": 512px에서 입이 작은 영역이라
-    # 선이 뭉개지던 문제 — 이 어휘로 깨끗한 곡선 미소가 나온다(probe10, 정제 패스 불필요)
-    return ("cutemon creature, full body, standing, "
-            f"a cute round {palette} creature with a cute simple face, "
-            f"round dot eyes, a tiny clean simple smile, clean thin lineart, {feat}"
-            f"{part}distinct body parts, chubby simple body, flat colors")
+    sig = f"{signature}, " if signature else ""
+    # 학습 캡션 어형("cutemon, a {색} creature, white background")을 맨 앞에 그대로 —
+    # 색 견인은 캡션 분포와 같은 위치·어형일 때 가장 강하다. "no humans, solo"는
+    # danbooru 태그(Animagine 네이티브 어휘). 특징은 중간 위치 유지 — 맨 앞이면
+    # 안경 하나가 디자인 전체를 지배한다(사용자 피드백). 전체 77토큰 이내 유지 필수 —
+    # 초과분은 에러 없이 잘린다(SD1.5 시절 94토큰으로 꼬리 유실 실측).
+    # 시그니처(속성 부위)가 들어가며 "chubby simple body"는 토큰 예산에서 제외됨.
+    return (f"cutemon, a {palette} creature, white background, "
+            "no humans, solo, full body, standing, a cute simple face, "
+            f"round dot eyes, a tiny clean simple smile, {feat}"
+            f"{part}{sig}flat colors, clean thin lineart")
 
 
-# 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 팔레트.
-# (한글명, 뱃지 RGB, 프롬프트 팔레트)
+# 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 + 시그니처 부위.
+# 시그니처 = 파이리의 꼬리 불꽃처럼 "또렷한 정체성 부위"(사용자 피드백 — 일반 어휘만으론
+# '그냥 만들어진 무언가'가 됨). 속성이 색뿐 아니라 디자인 정체성을 결정한다.
+# (한글명, 뱃지 RGB, 프롬프트 팔레트, 시그니처 구절)
 TYPES = [
-    ("불", (239, 118, 61), "fiery orange and red"),
-    ("물", (88, 154, 240), "blue and aqua"),
-    ("풀", (120, 200, 80), "fresh green"),
-    ("전기", (247, 200, 46), "bright yellow"),
-    ("페어리", (238, 153, 200), "pastel pink and white"),
+    ("불", (239, 118, 61), "fiery orange and red",
+     "a small flame on its tail tip, tiny claws on its paws"),
+    ("물", (88, 154, 240), "blue and aqua",
+     "fin ears and a droplet-shaped tail"),
+    ("풀", (120, 200, 80), "fresh green",
+     "a leaf sprout on its head and a leafy tail"),
+    ("전기", (247, 200, 46), "bright yellow",
+     "a lightning-shaped tail and bright cheek marks"),
+    ("페어리", (238, 153, 200), "pastel pink and white",
+     "ribbon ears and a fluffy curled tail"),
 ]
 
 # CLIP 제로샷 특징 후보: (프롬프트 구절, 한국어 표시, 긍정 문장, 부정 문장)
@@ -92,15 +100,15 @@ FEATURES = [
     ("with a wide broad forehead", "넓은 이마", "a person with a wide broad forehead", "a person with a forehead covered by bangs"),
 ]
 
-# 앞쪽 = 악타입 억제(귀여움 확보), 뒤쪽 = 사람이 아니라 크리처로 채우게 만드는 장치
+# 77토큰 이내로 압축(초과분은 조용히 잘린다 — SD1.5 시절 실측). 앞쪽 = 악타입 억제,
+# 중간 = 사람 차단, 뒤쪽 = XL 스윕에서 확인된 아티팩트(빈 눈·입 뭉개짐) + 품질 태그.
 NEG_PROMPT = (
-    "monster, demon, scary, evil, fangs, sharp teeth, claws, bat wings, "
-    "dark, muscular, horror, "
-    "human, person, human face, realistic face, photograph, text, watermark, "
-    "blurry, deformed, extra limbs, ugly, "
-    "realistic eyes, detailed iris, human eyes, "
-    "faceless, no face, mechanical, robot, pokeball, orb, machine, "
-    "messy mouth, smudged face, distorted mouth, extra mouth, noisy lines"
+    # "claws"는 네거티브 금지 — 시그니처(불 타입 발톱)를 억제한다. 악타입 차단은 나머지로.
+    "monster, scary, evil, sharp teeth, dark, horror, "
+    "human, person, realistic, photograph, text, watermark, "
+    "blurry, deformed, extra limbs, faceless, empty eyes, blank eyes, "
+    "messy mouth, distorted mouth, extra mouth, noisy lines, "
+    "lowres, bad anatomy, worst quality, low quality"
 )
 MAX_UPLOAD = 10 * 1024 * 1024
 
@@ -110,56 +118,25 @@ log = logging.getLogger("monsnap")
 st.set_page_config(page_title="MonSnap", page_icon="🐲")
 
 
-@st.cache_resource(show_spinner="모델 로딩 중… (최초 1회 ~5GB 다운로드)")
+@st.cache_resource(show_spinner="모델 로딩 중… (최초 1회 ~7GB 다운로드)")
 def pipeline():
     import torch
-    from diffusers import StableDiffusionImg2ImgPipeline, UniPCMultistepScheduler
+    from diffusers import StableDiffusionXLImg2ImgPipeline, UniPCMultistepScheduler
 
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        safety_checker=None,  # 얼굴 입력에서 오탐이 잦고 VRAM 1.2GB를 더 먹는다
-        requires_safety_checker=False,
-    )
+    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+        BASE_MODEL, torch_dtype=torch.float16)
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.load_ip_adapter(
         "h94/IP-Adapter-FaceID", subfolder=None,
-        weight_name="ip-adapter-faceid_sd15.bin", image_encoder_folder=None,
+        weight_name="ip-adapter-faceid_sdxl.bin", image_encoder_folder=None,
     )
     if STYLE_LORA:
-        pipe.load_lora_weights(_style_lora_state(STYLE_LORA), adapter_name="style")
-    if STYLE_LORA2:
-        pipe.load_lora_weights(STYLE_LORA2, adapter_name="style2")
-    # ponytail: VRAM 8GB — 전체 상주 대신 레이어 단위 오프로드. 더 빠르게 하려면
-    # VRAM 12GB 이상에서 pipe.to("cuda")로 교체.
+        pipe.load_lora_weights(STYLE_LORA, adapter_name="style")
+    # ponytail: VRAM 8GB — 전체 상주 대신 레이어 단위 오프로드 + 1024 디코드 타일링.
+    # VRAM 12GB 이상이면 pipe.to("cuda")로 교체해 가속 가능.
     pipe.enable_model_cpu_offload()
+    pipe.enable_vae_tiling()
     return pipe
-
-
-def _style_lora_state(repo: str):
-    """임시 공개 LoRA(2023 attn-proc 포맷)를 PEFT 키로 변환해 state dict로 반환.
-
-    모던 포맷(자체 학습본)은 변환 없이 그대로 통과시킨다. 구식 포맷을 그냥
-    load_lora_weights에 넘기면 에러 없이 '키 0개 매칭' 경고만 내고 무시된다(실측) —
-    스타일이 조용히 빠진 채 사람 그림이 나오므로 여기서 미리 변환한다.
-    """
-    import torch
-    from huggingface_hub import hf_hub_download
-
-    try:
-        path = hf_hub_download(repo, "pytorch_lora_weights.bin")
-    except Exception:  # .bin이 없으면 모던 포맷 레포 — 그대로 로드
-        return repo
-    sd = torch.load(path, map_location="cpu", weights_only=True)
-    if not any(".processor." in k for k in sd):
-        return repo
-    return {
-        "unet." + k.replace(".processor.", ".").replace("to_out_lora", "to_out.0")
-        .replace("to_q_lora", "to_q").replace("to_k_lora", "to_k")
-        .replace("to_v_lora", "to_v")
-        .replace(".down.weight", ".lora_A.weight").replace(".up.weight", ".lora_B.weight"): v
-        for k, v in sd.items()
-    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -229,10 +206,13 @@ def ref_index():
     return paths, torch.cat(embs), shapes
 
 
-# 사지 구조가 있는 체형만 밑그림 후보로 — 사랑둥이류(heads/fish/ball/blob…)가 밑그림이
-# 되면 변신 후 '이도저도 아닌 덩어리'가 된다(probe14 진단). 구조가 있는 원형에서
-# 출발해야 팔·다리·꼬리가 읽히는 몸이 나온다.
-STRUCTURED_SHAPES = {"upright", "quadruped", "humanoid", "legs", "arms", "wings"}
+# 부위가 안 읽히는 체형(heads/ball/blob)만 밑그림 후보에서 배제 — 무사지 원형이
+# 밑그림이 되면 변신 후 '이도저도 아닌 덩어리'가 된다(probe14 진단).
+# proto_dex(사전 생성·큐레이션 도감)는 부위 가독성이 선별 기준이라 fish·armor·
+# tentacles 등도 안전. ⚠ dataset/cute(포켓몬 아트)로 롤백 시엔 구 필터
+# {"upright","quadruped","humanoid","legs","arms","wings"} 복원 권장(구 풀은 fish도 덩어리).
+STRUCTURED_SHAPES = {"upright", "quadruped", "humanoid", "legs", "arms", "wings",
+                     "fish", "squiggle", "armor", "bug-wings", "tentacles"}
 REF_TOP_K = 5  # top-1 고정이 아니라 상위 K 중 시드로 결정론 선택 — 원형 다양성 확보
 
 
@@ -359,7 +339,7 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
     seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:4], "big")
     ref, ref_sim, ref_shape = match_reference(photo, pick=seed)
     type_src = name.strip().encode() if name.strip() else seed_src
-    type_ko, type_rgb, palette = TYPES[
+    type_ko, type_rgb, palette, signature = TYPES[
         int.from_bytes(hashlib.sha256(type_src).digest()[:4], "big") % len(TYPES)]
     info = {
         "traits": feature_ko or "없음 (순수 원형)",
@@ -372,9 +352,7 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
     if STYLE_LORA:
         # faceid_0(FaceID 체크포인트에 내장된 LoRA)도 같이 켜야 한다 —
         # style만 넘기면 set_adapters가 faceid_0을 비활성화해 닮음이 사라진다(실측)
-        names = ["faceid_0", "style"] + (["style2"] if STYLE_LORA2 else [])
-        weights = [1.0, lora_weight] + ([STYLE2_WEIGHT] if STYLE_LORA2 else [])
-        pipe.set_adapters(names, adapter_weights=weights)
+        pipe.set_adapters(["faceid_0", "style"], adapter_weights=[1.0, lora_weight])
     if emb is None:  # 얼굴 없음 — FaceID 끄고 0벡터로 채워 파이프라인 요구만 충족
         pipe.set_ip_adapter_scale(0.0)
         emb = torch.zeros((2, 1, 512), dtype=torch.float16, device="cuda")
@@ -382,14 +360,14 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
         pipe.set_ip_adapter_scale(faceid_scale)
 
     result = pipe(
-        prompt=build_prompt(feature, palette, ref_shape),
+        prompt=build_prompt(feature, palette, ref_shape, signature),
         negative_prompt=NEG_PROMPT,
-        image=ref,
+        image=ref.resize((GEN_SIZE, GEN_SIZE)),  # 원형 512 → SDXL 네이티브 1024
         strength=strength,
         ip_adapter_image_embeds=[emb],
         num_inference_steps=steps,
-        # 9.0 = 기본(7.5)보다 강한 프롬프트·네거티브 견인 — "human, person" 억제가
-        # 세져 시드가 바뀌어도 사람 캐리커처로 안 떨어진다(probe4 실측)
+        # 9.0 = XL 기본(5~7)보다 강한 견인 — CFG 6에선 입·특징이 흐릿, 9에서 또렷
+        # (체크포인트 스윕 타이브레이커 실측. SD1.5 시절 probe4와 같은 결론)
         guidance_scale=9.0,
         generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
@@ -433,9 +411,8 @@ with st.sidebar:
         "변신 정도", 0.5, 0.95, 0.85, 0.05,
         help="낮으면 매칭된 원형 그대로, 높으면 완전히 새로운 창작",
     )
-    # probe9: v3 1.1 + v2 0.7 혼합이 최적 — 슬라이더는 주 스타일(v3)만 조절
     lora_weight = st.slider(
-        "스타일 강도", 0.0, 1.5, 1.1, 0.05,
+        "스타일 강도", 0.0, 1.5, 1.0, 0.05,
         help="크리처 그림체로 미는 힘 — 약하면 사람 그림이 됩니다",
     )
     faceid_scale = st.slider(
