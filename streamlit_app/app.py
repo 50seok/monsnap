@@ -66,10 +66,13 @@ def build_prompt(feature: str | None, palette: str, shape: str = "",
     # 안경 하나가 디자인 전체를 지배한다(사용자 피드백). 전체 77토큰 이내 유지 필수 —
     # 초과분은 에러 없이 잘린다(SD1.5 시절 94토큰으로 꼬리 유실 실측).
     # 시그니처(속성 부위)가 들어가며 "chubby simple body"는 토큰 예산에서 제외됨.
-    return (f"cutemon, a {palette} creature, white background, "
+    # 시그니처를 팔레트 바로 뒤(전체 프롬프트 앞쪽)로 승격 — 기존 위치(맨 뒤)에서는
+    # 전기·페어리 시그니처가 부분적으로만 반영됐음(실측, PRD §13). CLIP 텍스트
+    # 인코더는 앞쪽 토큰이 강하다(probe7b·c와 동일 원리). 토큰 수는 그대로(재배치만).
+    return (f"cutemon, a {palette} creature, {sig}white background, "
             f"no humans, solo, full body, {pose}, a cute simple face, "
             f"round dot eyes, a tiny clean simple smile, {feat}"
-            f"{part}{sig}flat colors, clean thin lineart")
+            f"{part}flat colors, clean thin lineart")
 
 
 # 속성 시스템(PRD §12-8 계층 시드 완성형): 이름 해시 → 속성 → 몸 색 + 시그니처 부위.
