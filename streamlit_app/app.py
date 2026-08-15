@@ -244,7 +244,10 @@ def match_reference(crop: Image.Image, pick: int = 0) -> tuple[Image.Image, floa
 
 
 YUNET = Path(__file__).parent / "models" / "yunet.onnx"
-DETECT_MAX = 640  # 검출은 축소본으로 — 휴대폰 원본(4000px)을 그대로 넣으면 느리고 불안정
+DETECT_MAX = 1280  # 검출은 축소본으로(휴대폰 원본 그대로는 느리고 불안정). 640은
+# 전신샷(얼굴이 프레임의 ~12% 이하)에서 검출 실패 실측 — 1280은 같은 케이스에서 성공,
+# 속도 비용은 무시 가능(+20ms 내외). 여성 사용자가 얼굴 크게 나온 사진보다 이미
+# 찍어둔 전신·인물샷을 올리는 경우가 많다는 피드백 반영.
 
 
 @st.cache_resource(show_spinner=False)
