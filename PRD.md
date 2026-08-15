@@ -235,6 +235,25 @@
   강화 ④ 팔레트 견인(우선순위 낮음). strength 0.7 반영 후 재실측 권장(위 순서는
   strength 수정 전 기준이라 우선순위 재검토 여지 있음).
 
+### 진행 상황 4 (2026-08-15 밤) — 원형 도감 +10종 확장(30→40)
+- **배치 생성 strength 재검증**: 런타임(0.7)과 반대로 사진→원형 변환 단계는 **0.8이
+  최적**(0.6은 사진 질감이 "가시털"처럼 남는 아티팩트 확인) — 방향이 다른 변환이라
+  런타임 strength 결론을 그대로 적용하면 안 됨. `proto_dex_batch.py` 수정 불필요.
+- **수집**: Wikimedia API 레이트리밋(429)으로 목표 20종 중 17종만 신규 확보(37→54,
+  나머지 11종은 추후 재시도 필요 — baby_elephant·meerkat·capybara·hermit_crab·
+  garden_snail·dragonfly·caterpillar·squid·baby_goat·swan_cygnet·baby_alpaca).
+- **큐레이션**(부위 가독성 기준, 시드 최대 3개까지 비교): 17종 중 **10종 채택**
+  (chick_chicken·duckling·european_robin·ladybug·otter_pup·parakeet·mouse·
+  flying_squirrel·flamingo_chick·budgerigar) → `dataset/proto_dex/` 30→**40종**.
+  **7종 제외**: ferret·guinea_pig(원본은 깨끗한데 생성 결과가 매번 원본 동물과
+  무관한 형태로 나옴 — 원인 불명, 향후 재시도 여지) / pufferfish(원본이 안 부푼
+  평범한 물고기 사진 — 오매칭) / koi_fish(원본이 사실 게 다리 사진 — 완전 오매칭)
+  / guppy_fish(원본에 물고기 2마리 — 결과물도 이중 피사체로 나옴) / penguin_chick·
+  sloth(원본 배경에 고깔/나뭇가지가 껴서 rembg가 같이 오려냄 — 배경 오염).
+  **교훈**: Wikimedia 검색 자동 수집은 원본 품질 검증(단일 피사체·배경 오염 여부)
+  없이 그대로 씀 — 다음 확장 라운드에서 원본 프리뷰 확인 단계 추가 권장.
+- `dataset/`는 gitignore 대상이라 이미지·manifest 자체는 커밋 안 됨(로컬 전용).
+
 ### 다음 세션 재개 키워드 (2026-08-15)
 `원형 도감 확장 100종` `불량 원본 교체` `시그니처 강화(전기·페어리)` `팔레트 견인`
 
