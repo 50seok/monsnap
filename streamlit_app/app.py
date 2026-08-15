@@ -48,11 +48,18 @@ SHAPE_PHRASES = {
 }
 
 
+# 다리가 없는 체형에 "standing"을 강제하면 모델이 없는 다리를 억지로 만들어 붙여
+# 비례가 깨지고 눈이 묻힌다(물고기형 실측, 사용자 피드백) — 체형별 자세어로 대체.
+POSE_PHRASES = {"fish": "swimming pose", "squiggle": "swimming pose",
+                "tentacles": "floating pose"}
+
+
 def build_prompt(feature: str | None, palette: str, shape: str = "",
                  signature: str = "") -> str:
     feat = f"{feature}, " if feature else ""
     part = f"{SHAPE_PHRASES[shape]}, " if shape in SHAPE_PHRASES else ""
     sig = f"{signature}, " if signature else ""
+    pose = POSE_PHRASES.get(shape, "standing")
     # 학습 캡션 어형("cutemon, a {색} creature, white background")을 맨 앞에 그대로 —
     # 색 견인은 캡션 분포와 같은 위치·어형일 때 가장 강하다. "no humans, solo"는
     # danbooru 태그(Animagine 네이티브 어휘). 특징은 중간 위치 유지 — 맨 앞이면
@@ -60,7 +67,7 @@ def build_prompt(feature: str | None, palette: str, shape: str = "",
     # 초과분은 에러 없이 잘린다(SD1.5 시절 94토큰으로 꼬리 유실 실측).
     # 시그니처(속성 부위)가 들어가며 "chubby simple body"는 토큰 예산에서 제외됨.
     return (f"cutemon, a {palette} creature, white background, "
-            "no humans, solo, full body, standing, a cute simple face, "
+            f"no humans, solo, full body, {pose}, a cute simple face, "
             f"round dot eyes, a tiny clean simple smile, {feat}"
             f"{part}{sig}flat colors, clean thin lineart")
 
@@ -405,10 +412,13 @@ st.caption("사진을 찍으면 나만의 몬스터가 태어납니다")
 
 with st.sidebar:
     st.subheader("생성 설정")
-    # probe8 실측: 0.85 = 눈·색이 확실히 새 창작으로 바뀌면서 특징(안경)은 유지.
-    # 0.7 이하는 원형과 너무 닮고(사용자 피드백 + IP 리스크), 0.9부터 특징이 소실됨.
+    # probe8(0.85 최적) 실측은 REF_DIR=dataset/cute(포켓몬 아트) 시절 값 — 그때는
+    # 원형과 닮는 게 IP 리스크라 일부러 높였다. REF_DIR=proto_dex(동물 기반) 전환
+    # 후 재실측(probe_strength_grid): 0.85는 lora_weight를 낮춰도 원형 구조가 전부
+    # 지워지고 포켓몬 학습 LoRA로 재구성됨(물고기 레퍼런스가 발톱 4족 생물이 됨).
+    # 0.5~0.7에서는 원형 실루엣이 살아남으면서 색·무늬·표정은 창작됨 — 0.7 채택.
     strength = st.slider(
-        "변신 정도", 0.5, 0.95, 0.85, 0.05,
+        "변신 정도", 0.5, 0.95, 0.7, 0.05,
         help="낮으면 매칭된 원형 그대로, 높으면 완전히 새로운 창작",
     )
     lora_weight = st.slider(
