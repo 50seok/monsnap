@@ -309,7 +309,134 @@
   명시적으로 추가하면 다음 확장(11종 재시도분 등) 때 같은 문제 재발 방지 가능
   — 이번엔 사후 검토로 처리, 사전 필터는 미구현.
 
-### 다음 세션 재개 키워드 (2026-08-15)
+### 진행 상황 8 (2026-08-15 밤 2차) — 팔레트 견인 재그리드 + 원인 확정 + 후처리 색상 보정 도입, 선명도 사전 필터 구현
+- **팔레트 재그리드 실측** (`tools/probe_palette.py`, GPU): strength=0.7 고정,
+  FaceID 0으로 꺼서 순수 격리, tree_frog 원형(원본이 초록·갈색·노랑) × 5타입.
+  결과(`dataset/review/probe_palette_strength07.png`): **5개 전부 형태·색이
+  거의 동일** — 물(파랑)·페어리(분홍) **완전 실패**(해당 색 전혀 안 나타남),
+  불은 반점 정도만, 풀·전기는 원형에 이미 있던 색과 우연히 겹쳐 성공처럼 보일
+  뿐. **가설 확정**: strength 0.7이 원형의 원래 색까지 함께 보존해 프롬프트
+  팔레트가 밀림 — 진행상황6의 우려가 실제로 심각한 수준이었음을 확인.
+- **후처리 색상 보정으로 해결** (`tools/probe_recolor.py`로 저비용 검증 후
+  `app.py`에 `recolor()` 통합): 채도 있는 픽셀(배경·라인아트 자동 제외)만
+  HSV 색조를 TYPES 뱃지 RGB로 강제 이동, 명도(음영)는 보존. **strength는
+  그대로 0.7 유지**(원형 구조는 계속 잘 보존해야 하므로) — 색만 결정론적
+  후처리로 보장하는 방향으로 전환. 검증: ① 320px 크롭 저비용 실험에서 물=파랑
+  ·페어리=분홍 등 5종 전부 목표 색으로 정확히 이동, 라인아트·셀 셰이딩 음영
+  손상 없음(`dataset/review/probe_recolor_compare.png`) ② `app.py`의 실제
+  `recolor()` 함수를 AST로 추출해 재검증 — 5타입 전부 결과 평균 색조가
+  목표 색조와 소수점 이하까지 일치(수학적 정합성 확인).
+  ⚠ **실제 얼굴 사진으로 하는 라이브 e2e는 미검증**(이 세션엔 사람 사진 파일이
+  없어 GPU 격리 테스트로 대체) — 다음 실사용 시 스타일·닮음이 정상인지 확인 필요.
+- **원형 도감 사전 필터 구현** (`tools/proto_dex_filter.py`): 배치 생성(GPU) 전
+  `dataset/animals/*.png`(수집 원본) 단계에서 ① 거의 빈 캔버스(rembg 실패)
+  ② 다중 피사체(연결성분 분석)를 자동 검출. **실제 과거 데이터로 역검증**:
+  budgerigar(BLANK, fg=0.000 — rembg가 배경 제거에 완전히 실패해 원본이
+  빈 캔버스였고, 그게 생성 후보를 색 빠진 흐릿한 결과로 만든 인과관계까지
+  확인) · deer_fawn(DUP, 2nd=0.382 — 실제 동물 2마리) 정확히 검출, 덤으로
+  이전 라운드(40종 단계)에서 수작업 제외됐던 guppy_fish(DUP, 2nd=0.855 —
+  물고기 2마리)도 정확히 검출. bear_cub는 예상대로 통과(원본·생성본 다
+  멀쩡, "부위 경계 없는 덩어리"는 구도적 판단이라 필터 범위 밖 — 문서화함).
+  ⚠ **이번 세션엔 신규 종 수집은 안 함**(45종 그대로) — Wikimedia 수집기
+  (`build_animal_pool.py`)가 스크래치패드 전용이라 세션 종료로 소실된 상태,
+  재구축은 다음 확장 라운드 착수 시 필요. 이 필터는 그 다음 라운드에 바로
+  꽂아 쓸 수 있게 레포에 커밋 대상으로 작성(스크래치패드 아님).
+- **미커밋 상태**: `streamlit_app/app.py`(recolor 통합) 수정 +
+  `tools/probe_palette.py`·`tools/probe_recolor.py`·`tools/proto_dex_filter.py`
+  신규 — 4개 파일, git status 확인됨, 커밋은 사용자 확인 후.
+
+### 진행 상황 9 (2026-08-15 밤 3차) — recolor 라이브 e2e 확인 (실사진 23장, 해소)
+- **버그 재현 확인**: 재통합 직후 사용자가 든 첫 라이브 스크린샷은 결과에 초록·
+  청록·파랑이 뒤섞여 있었음 — recolor()는 채도 있는 픽셀을 전부 한 색조로
+  통일해야 하므로 이 패턴은 이론상 recolor 미적용(구 코드로 뜬 서버) 신호로
+  진단. 서버 재시작 요청 → 재시작.
+- **실사진 배치 검증** (`tools/batch_generate.py` 신규 — app.py의 실제
+  `generate()`/`make_card()`를 AST로 그대로 가져와 Streamlit 서버 없이 배치
+  실행, 재구현 아님): 카카오톡 폴더 사진 24장(중복 1장 제외 23장 고유)을
+  실제 프로덕션 코드 경로로 전량 실행. **결과: 23장 전부 타입 색이 정확히
+  반영됨**(페어리=핑크, 풀=초록, 전기=금색/노랑 등) — recolor 버그는 서버
+  재시작으로 완전히 해소, 코드 자체는 처음부터 정상이었음(진행상황8의 진단이
+  맞았음).
+- **부수 관찰**: 눈 가시성(사용자 1차 지적)은 대체로 양호하나 편차 있음 —
+  일부(No.807 등)는 큰 원형 눈 2개로 또렷, 일부(측면 포즈 원형)는 눈 1개만
+  작게 보여 "찾기 애매함" 여지 남음. 이번엔 관찰만, 후속 조치 안 함(사용자가
+  결과 보고 판단 필요).
+- **실행 함정 추가**: `grep`으로 tqdm 진행바 섞인 GPU 스크립트 출력을
+  실시간 필터링하면 grep이 스트림을 "binary"로 오판해 이후 결과 줄을 전부
+  삼킬 수 있음(캐리지리턴·멀티바이트 UTF-8 분절 추정) — 확인은 반드시 파일로
+  받은 뒤(생성물 존재 여부 등 1차 소스로) 판단, 실시간 파이프 필터링에 의존
+  금지.
+- **개인정보 확인**: 사용자 실사진(카카오톡 폴더) + 생성 카드 전부
+  `dataset/`(전체 gitignore 대상) 아래에 있어 커밋·푸시 리스크 없음 확인(`git
+  check-ignore` 검증 완료).
+
+### 진행 상황 10 (2026-08-15 밤 4차) — 원형 매칭 편중 진단 (사용자 지적: "같은 부위 반복")
+- **증상**: 사용자가 생성물에서 코일형 부위(코끼리 코로 오인)가 반복된다고 지적.
+- **진단** (`tools/diag_ref_match.py` 신규 — match_reference()를 GPU 없이 실제로
+  돌려 매칭 분포 집계): 23장 전부 대조 결과 **45종 도감 중 딱 6종만 매칭됨**
+  (axolotl 5회, flying_squirrel 5회, lamb 4회, betta_fish 4회, flamingo_chick
+  4회, otter_pup 2회). 사용자가 본 코일형 부위는 **axolotl.png**의 늘어진
+  주둥이(코끼리 코 아님) — `dataset/proto_dex/axolotl.png` 육안 대조로 확인.
+- **원인 추정**: REF_TOP_K=5(사람별 CLIP 상위 5개 중 이름 해시로 선택) 구조상,
+  이 6종이 다양한 얼굴에 걸쳐 폭넓게 "상위 5" 안에 드는 **범용적 임베딩
+  위치**를 가진 것으로 보임 — 개별 얼굴 특성이 아니라 원형 풀 자체의 분포
+  편중 가능성. 미해결·미착수(사용자 확인 대기) — REF_TOP_K 확대, 매칭 시
+  이미 뽑힌 원형 가중치 감소, 또는 45종 자체를 늘려 완화 등이 후보.
+
+- **해소**: K값별 실측(같은 23장, `REF_TOP_K` 5/10/15/20 비교) — K=5:6종,
+  K=10:10종, K=15:12종, K=20:15종 사용, 단조 개선 확인. **K=15 채택**(`app.py`
+  반영 완료) — 20 이상은 구조형 후보 절반을 넘어 "닮은 원형 선택"의 의미가
+  옅어짐. 사용자 결정: ②(히스토리 기반 가중치)는 "같은 사진=항상 같은 몬스터"
+  결정론 원칙과 충돌해 기각, ③(도감 확장)은 상충 없는 별도 후속 과제로 유지.
+
+### 진행 상황 11 (2026-08-16) — 아키텍처 전환 결정: 캡션 재설계 + 재학습 + txt2img
+- **사용자 제기**: 결과물 전반이 근본적으로 이상함(눈 위치·부위 정체성 불명,
+  원형 45종 자체 품질 낮음). 뒤집어 엎는 방향이더라도 근본 원인·구체 방안 요구.
+  원래 취지 재확인 = "포켓몬 1025장을 학습해 새 포켓몬 창조 + 사람 사진으로 재미".
+- **근본 원인 3가지 (코드 증거로 진단)**: ① v3 학습 캡션이 색깔뿐
+  (`build_full_dataset.py`) → 그림체만 배우고 체형↔부위 설계 문법을 못 배움
+  ② 복사본의 복사본(동물사진→AI 원형→img2img, 아무도 디자인한 적 없는 그림)
+  ③ 4개 힘 경쟁(원형 구조·부위 텍스트·FaceID·LoRA). 상세 플랜 =
+  `~/.claude/plans/synthetic-watching-honey.md`.
+- **결정(사용자 승인)**: 로컬 재학습($0) + 사람 연결은 시드·특징·닮음(FaceID)
+  유지. Phase A 캡션 재설계 → B LoRA v4 재학습 → C app.py txt2img 전환
+  (proto_dex 매칭 삭제) → D 검증.
+- **Phase A 완료** (`tools/build_captions_v4.py` 신규): 캡션 =
+  `cutemon, {genus} motif, {체형 구절}, a {색} creature, {WD14 부위 태그}, solo,
+  full body, white background`. ① 모티브 = PokéAPI genera("Mouse Pokémon"→
+  mouse — 디자인 컨셉 정답 데이터, 사용자 제안) ② 체형 = species.shape 14종 →
+  SHAPE_TAGS 고정 구절(⚠ 추론 프롬프트와 동일 어휘 의무 — 한쪽만 바꾸면 견인
+  소실) ③ 부위 = WD14 태거(wd-swinv2-tagger-v3) general 태그만, character/
+  "pokemon" 포함 태그 전부 드롭(§10 정합). CLIPTokenizer 실측으로 75토큰 이내
+  트림. `dataset/full/metadata.jsonl` 1025장 재생성 완료(캐시:
+  `meta_shapes.json`·`wd14_tags.json` — 재실행 무료). 품질 검증: 리자몽에
+  `flame-tipped tail`, 차곡차곡에 `rampart motif` 등 시그니처 정확 포착.
+- **Phase B 상태**: 학습 개시 직후 사용자 지시("학습중지")로 중단 — 모델 로딩
+  단계라 체크포인트 없음, 내일 같은 명령으로 처음부터. GPU 0 MiB·잔여 프로세스
+  없음 확인. 재개 명령(training/ 에서, Streamlit 서버 꺼진 상태):
+  `../streamlit_app/.venv/Scripts/python.exe -m accelerate.commands.launch
+  train_text_to_image_lora_sdxl.py --pretrained_model_name_or_path=
+  cagliostrolab/animagine-xl-4.0 --pretrained_vae_model_name_or_path=
+  madebyollin/sdxl-vae-fp16-fix --train_data_dir=../dataset/full
+  --caption_column=text --resolution=512 --random_flip --train_batch_size=1
+  --max_train_steps=5000 --checkpointing_steps=1000 --learning_rate=1e-4
+  --lr_scheduler=cosine --lr_warmup_steps=0 --mixed_precision=fp16
+  --gradient_checkpointing --rank=16 --seed=42 --output_dir=lora_sdxl_v4`
+  (~4h, 백그라운드+로그 OK — 조용히 죽는 함정은 생성 프로세스에만 해당.
+  8GB 대응 수정 682-683행 존재 확인됨.)
+- **미착수**: Phase C(전환 직전 git 태그 `ref-anchored-final` 생성 →
+  match_reference/ref_index/REF_* 삭제 → SHAPE_TAGS 동일 어휘 프롬프트 + 얼굴
+  해시→체형 결정, recolor·FaceID 0.2·카드 UI 유지 — 학습 중 병행 가능) /
+  Phase D(체크포인트 스윕 3000/4000/5000 포그라운드 + 실사진 23장 배치를
+  `batch_e2e/`와 비교). 폴백: 언더핏 시 rank 32 → FLUX 클라우드($2~10).
+
+### 다음 세션 재개 키워드 (2026-08-16)
+`학습 재개` — 위 Phase B 명령 실행부터.
+
+### 다음 세션 재개 키워드 (2026-08-15 밤 4차) — 위로 해소됨
+`원형 매칭 편중 완화(6/45 쏠림)` `원형 도감 확장(수집기 재구축 + proto_dex_filter.py 적용)` `눈 가시성 개선(선택)`
+
+### 다음 세션 재개 키워드 (2026-08-15) — 위 라운드로 해소됨
 `팔레트 견인(strength 0.7과 함께 재그리드)` `원형 도감 확장(11종 재시도 + 선명도 사전 필터)`
 
 ### 다음 세션 재개 키워드
