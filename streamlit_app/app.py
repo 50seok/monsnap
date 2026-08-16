@@ -1,3 +1,4 @@
+import colorsys
 import hashlib
 import io
 import logging
@@ -223,7 +224,11 @@ def ref_index():
 # {"upright","quadruped","humanoid","legs","arms","wings"} 복원 권장(구 풀은 fish도 덩어리).
 STRUCTURED_SHAPES = {"upright", "quadruped", "humanoid", "legs", "arms", "wings",
                      "fish", "squiggle", "armor", "bug-wings", "tentacles"}
-REF_TOP_K = 5  # top-1 고정이 아니라 상위 K 중 시드로 결정론 선택 — 원형 다양성 확보
+# top-1 고정이 아니라 상위 K 중 시드로 결정론 선택 — 원형 다양성 확보. K=5는
+# 실사진 23장 실측(tools/diag_ref_match.py)에서 45종 중 6종에만 쏠림(axolotl·
+# flying_squirrel 등 "CLIP상 범용적인" 소수 원형이 여러 얼굴의 상위 5에 두루
+# 듦) — K=15에서 12종으로 다양성 2배 확인, 그 이상은 매칭 의미가 옅어짐.
+REF_TOP_K = 15
 
 
 def match_reference(crop: Image.Image, pick: int = 0) -> tuple[Image.Image, float, str]:
@@ -334,6 +339,37 @@ def identity(photo_bytes: bytes, photo: Image.Image):
     return emb.to(dtype=torch.float16, device="cuda"), normed.tobytes()
 
 
+def recolor(img: Image.Image, target_rgb: tuple[int, int, int],
+            sat_threshold: float = 0.15, sat_boost: float = 1.15) -> Image.Image:
+    """채도 있는 픽셀(배경·라인아트 제외)만 목표 색조로 이동, 명도(음영)는 보존.
+
+    strength=0.7에서는 프롬프트 팔레트가 원형의 원래 색에 밀려 거의 반영 안 됨
+    — 물/페어리 타입이 원형이 초록·갈색이면 파랑·분홍이 전혀 안 나타남을 실측
+    확인(tools/probe_palette.py, PRD §13). 프롬프트는 그대로 두고(시그니처·부위
+    어휘는 여전히 유효) 마지막에 색만 결정론적으로 보정 — 320px 크롭으로 저비용
+    검증 후(tools/probe_recolor.py) 채택. target_rgb = TYPES의 뱃지 색 재사용
+    (색조 테이블 중복 없음).
+    """
+    import numpy as np
+
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    maxc, minc = arr.max(-1), arr.min(-1)
+    v = maxc
+    s = np.where(maxc > 0, (maxc - minc) / np.where(maxc > 0, maxc, 1), 0.0)
+    mask = s > sat_threshold
+    new_s = np.clip(s * sat_boost, 0, 1)
+
+    hue, _, _ = colorsys.rgb_to_hsv(*(c / 255 for c in target_rgb))
+    i, f = int((hue * 6.0) % 6.0), (hue * 6.0) % 6.0 - int((hue * 6.0) % 6.0)
+    p, q, t = v * (1 - new_s), v * (1 - f * new_s), v * (1 - (1 - f) * new_s)
+    branch = [
+        np.stack([v, t, p], -1), np.stack([q, v, p], -1), np.stack([p, v, t], -1),
+        np.stack([p, q, v], -1), np.stack([t, p, v], -1), np.stack([v, p, q], -1),
+    ][i]
+    out = np.where(mask[..., None], branch, arr)
+    return Image.fromarray((out * 255).clip(0, 255).astype("uint8"))
+
+
 def generate(photo_bytes: bytes, strength: float, steps: int,
              lora_weight: float, faceid_scale: float, name: str):
     """(결과 PNG, 레퍼런스 PNG, 전처리 입력 PNG, 얼굴검출여부, 카드정보 dict) 반환.
@@ -384,6 +420,7 @@ def generate(photo_bytes: bytes, strength: float, steps: int,
         guidance_scale=9.0,
         generator=torch.Generator("cpu").manual_seed(seed),
     ).images[0]
+    result = recolor(result, type_rgb)
     return to_png(result), to_png(ref), to_png(photo), face_found, info
 
 
